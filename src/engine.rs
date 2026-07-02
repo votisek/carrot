@@ -1,15 +1,14 @@
 // the async engine. single threaded, everything is Rc, nothing is Send.
-//
 // each dispatch iteration drains four phases in order: EventHandling ->
-// Layout -> PostLayout -> Present. client reads land in the first, client
-// writes in PostLayout, so replies flush once per iteration after layout
-// has settled.
-//
+// Layout -> PostLayout -> Present.
 // NOTE: never hold a RefCell borrow across an .await.
 
 mod task;
+mod wheel;
 
 pub use task::SpawnedFuture;
+#[allow(unused_imports)]
+pub use wheel::{Wheel, WheelError};
 
 use crate::util::{NumCell, Time};
 use std::cell::{Cell, RefCell};
@@ -37,18 +36,17 @@ const NUM_PHASES: usize = 4;
 
 pub struct Engine {
     queues: [RefCell<VecDeque<Runnable>>; NUM_PHASES],
-    // runnables sitting in the queues (the stash doesn't count)
+    /// runnables in the queues; stash doesn't count
     num_queued: NumCell<usize>,
-    // completed sweeps; yield_now waits for this to move
+    /// completed sweeps; yield_now waits for this to move
     iteration: NumCell<u64>,
     yields: RefCell<VecDeque<Waker>>,
-    // drain buffers, swapped against the live queues so a batch can run
-    // while tasks keep pushing. borrowed for all of dispatch(), which is
-    // what makes dispatch non-reentrant.
+    /// drain buffers swapped against the live queues so a batch runs while
+    /// tasks keep pushing. borrowed for all of dispatch() - hence non-reentrant.
     stash: RefCell<VecDeque<Runnable>>,
     yield_stash: RefCell<VecDeque<Waker>>,
     stopped: Cell<bool>,
-    // one timestamp per sweep - every task in a sweep sees the same now
+    /// one timestamp per sweep
     now: Cell<Option<Time>>,
 }
 
@@ -82,9 +80,8 @@ impl Engine {
         task::spawn(self, name, phase, f)
     }
 
-    // run every queued task to quiescence. each phase drains to a fixed
-    // point before the next one starts; a wake into an earlier phase waits
-    // for the next sweep.
+    /// run every queued task to quiescence. each phase drains to a fixed point
+    /// before the next starts; a wake into an earlier phase waits for the next sweep.
     pub fn dispatch(&self) {
         let mut stash = self.stash.borrow_mut();
         let mut yield_stash = self.yield_stash.borrow_mut();
@@ -105,8 +102,7 @@ impl Engine {
                         return;
                     }
                 }
-                // no phase += 1: re-swap the same phase until it comes up
-                // empty, so same-phase wakes run in this sweep
+                // no phase += 1: re-swap until empty so same-phase wakes run this sweep
             }
             self.iteration.fetch_add(1);
             std::mem::swap(&mut *self.yields.borrow_mut(), &mut *yield_stash);
@@ -114,9 +110,7 @@ impl Engine {
                 w.wake();
             }
         }
-        // the sweep timestamp is only coherent inside dispatch; anyone
-        // asking between dispatches (arming a timer from the outside, say)
-        // gets a fresh read instead of however-old the last sweep is
+        // sweep timestamp is only coherent inside dispatch; outside callers get a fresh read
         self.now.set(None);
     }
 
@@ -124,13 +118,11 @@ impl Engine {
         self.stopped.set(true);
     }
 
-    // drop everything still queued. must follow stop() - dispatch bails
-    // mid-batch and the leftovers only get cleaned up here.
+    /// drop everything still queued. must follow stop() - dispatch bails mid-batch.
     pub fn clear(&self) {
-        // take-then-drop: a runnable's destructor can wake a live task,
-        // which pushes into the very queue being cleared - dropping under
-        // the borrow would panic. dropped payloads can also enqueue fresh
-        // runnables, so sweep until everything stays empty.
+        // take-then-drop: a runnable's destructor can wake a live task, pushing into
+        // the queue being cleared - dropping under the borrow would panic. dropped
+        // payloads can enqueue fresh runnables too, so sweep until empty.
         loop {
             let mut any = false;
             for q in &self.queues {
@@ -184,9 +176,8 @@ impl Engine {
 
 // -- yield --
 
-// resolves once a full sweep has completed after creation. this is the
-// fairness valve: a task that re-wakes itself without ever yielding keeps
-// its phase queue busy and dispatch never returns to the ring.
+/// resolves once a full sweep completes after creation. the fairness valve:
+/// a task that re-wakes itself without yielding would starve the ring.
 pub struct Yield {
     seen: u64,
     eng: Rc<Engine>,
@@ -267,8 +258,8 @@ mod tests {
 
     #[test]
     fn clear_survives_wake_on_drop() {
-        // a cancelled task's destructor wakes a live task from inside
-        // clear() - the push must not hit a held queue borrow
+        // a cancelled task's destructor wakes a live task from inside clear() -
+        // the push must not hit a held queue borrow
         struct WakeOnDrop(Rc<Cell<Option<std::task::Waker>>>);
         impl Drop for WakeOnDrop {
             fn drop(&mut self) {
