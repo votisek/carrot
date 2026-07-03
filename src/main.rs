@@ -51,10 +51,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("listening on {}", sock.name);
     let state = state::State::new(&engine, &ring, wheel);
 
-    // the ring owns the loop; this blocks until something calls stop().
-    // clients get accepted here once the client module lands.
+    let listen_fd = std::rc::Rc::new(sock.fd.try_clone()?);
+    let st = state.clone();
+    let acceptor = engine.spawn("acceptor", async move {
+        let _sock = sock;
+        loop {
+            match st.ring.accept(&listen_fd).await {
+                Ok(fd) => st.clients.spawn(&st, fd),
+                Err(e) => {
+                    // a broken listening socket takes the session with it
+                    eprintln!("carrot: accept failed: {e}");
+                    st.ring.stop();
+                    return;
+                }
+            }
+        }
+    });
+
+    // the ring owns the loop; this blocks until something calls stop()
     let res = ring.run();
 
+    drop(acceptor);
     state.clear();
     engine.clear();
     res?;
