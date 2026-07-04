@@ -1,0 +1,14 @@
+[package]
+name = "gen-shaders"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# spir-v assembler, pure rust. the shaders are built instruction by
+# instruction in main.rs - no shader language exists in this repo
+rspirv = "0.13"
+sha2 = "0.11"
+
+# standalone on purpose - carrot's build must never see this crate
+[workspace]
