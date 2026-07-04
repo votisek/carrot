@@ -37,6 +37,9 @@ fn main() {
         println!("carrot {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if std::env::args().any(|a| a == "drm-probe") {
+        std::process::exit(drm::device::probe_dump());
+    }
 
     if let Err(e) = run() {
         eprintln!("carrot: fatal: {e}");
