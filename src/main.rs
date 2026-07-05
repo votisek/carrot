@@ -85,11 +85,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("carrot: wl_seat unavailable: {e}"),
     }
 
-    // headless is a supported mode; the display comes up when a card is
-    // available, otherwise carrot still serves the socket
+    // headless is a supported mode; the display comes up when logind
+    // hands over a card (or, without a session, a direct open works)
     let st = state.clone();
     let bring_up = engine.spawn("bring-up", async move {
-        let display = output::start(&st, None).await;
+        let session = match dbus::LogindSession::take_control(&st.eng, &st.ring).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("carrot: no logind session ({e}); trying direct device access");
+                None
+            }
+        };
+        let display = output::start(&st, session.as_ref()).await;
+        if let Some(s) = &session {
+            *st.input.borrow_mut() = Some(input::start(&st, s).await);
+        }
+        *st.session.borrow_mut() = session;
         *st.display.borrow_mut() = display;
     });
 
