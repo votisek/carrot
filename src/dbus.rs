@@ -1,11 +1,506 @@
-// hand-rolled dbus, just enough for logind.
-//
-// bring-up order matters: EXTERNAL auth + NEGOTIATE_UNIX_FD, Hello,
-// GetSession (GetSessionByPID as the fallback), TakeControl, AddMatch,
-// then TakeDevice per device. fds ride out of band - count them per
-// message via UNIX_FDS or they get attributed to the wrong reply.
-//
-// TODO: endianness marker must be host endian, not a hardcoded 'l'
+// hand-rolled dbus client for logind: system-bus calls and signals only.
+// fds ride out of band; each message drains exactly UNIX_FDS off the front
+// of one arrival-ordered queue - get it wrong and a device fd lands on the
+// wrong reply.
 
 mod logind;
 mod wire;
+
+pub use logind::{DeviceEvent, LogindSession};
+
+use crate::engine::{Engine, SpawnedFuture};
+use crate::uring::{Ring, RingError};
+use crate::util::{AsyncEvent, AsyncQueue, NumCell};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::os::fd::OwnedFd;
+use std::rc::Rc;
+use wire::{MsgBuilder, Rd};
+
+#[derive(Debug)]
+pub enum DbusError {
+    Env(&'static str),
+    Connect(rustix::io::Errno),
+    Auth(&'static str),
+    BigEndianPeer,
+    Malformed(&'static str),
+    Ring(RingError),
+    Closed,
+    TooFewFds,
+    Call { name: String, text: String },
+    BadReply(&'static str),
+}
+
+impl fmt::Display for DbusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DbusError::Env(e) => write!(f, "{e}"),
+            DbusError::Connect(e) => write!(f, "connecting to the bus failed: {e}"),
+            DbusError::Auth(e) => write!(f, "bus auth failed: expected {e}"),
+            DbusError::BigEndianPeer => write!(f, "peer speaks big-endian dbus"),
+            DbusError::Malformed(e) => write!(f, "malformed dbus message: {e}"),
+            DbusError::Ring(e) => write!(f, "bus io failed: {e}"),
+            DbusError::Closed => write!(f, "the bus connection is closed"),
+            DbusError::TooFewFds => write!(f, "message claims more fds than arrived"),
+            DbusError::Call { name, text } => write!(f, "call failed: {name}: {text}"),
+            DbusError::BadReply(e) => write!(f, "unexpected reply shape: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DbusError {}
+
+impl From<RingError> for DbusError {
+    fn from(e: RingError) -> Self {
+        DbusError::Ring(e)
+    }
+}
+
+pub struct Reply {
+    pub sig: String,
+    pub body: Vec<u8>,
+    pub fds: Vec<Rc<OwnedFd>>,
+}
+
+impl Reply {
+    pub fn rd(&self) -> Rd<'_> {
+        Rd::new(&self.body, &self.fds)
+    }
+}
+
+pub struct SignalMsg {
+    pub path: Option<String>,
+    pub sig: String,
+    pub body: Vec<u8>,
+    pub fds: Vec<Rc<OwnedFd>>,
+}
+
+impl SignalMsg {
+    pub fn rd(&self) -> Rd<'_> {
+        Rd::new(&self.body, &self.fds)
+    }
+}
+
+pub enum Arg<'a> {
+    U32(u32),
+    Str(&'a str),
+    Bool(bool),
+}
+
+struct PendingReply {
+    done: AsyncEvent,
+    result: Cell<Option<Result<Reply, DbusError>>>,
+}
+
+type SignalCb = Box<dyn Fn(&SignalMsg)>;
+
+pub struct DbusConn {
+    ring: Rc<Ring>,
+    fd: Rc<OwnedFd>,
+    serial: NumCell<u64>,
+    closed: Cell<bool>,
+    replies: RefCell<HashMap<u32, Rc<PendingReply>>>,
+    signal_handlers: RefCell<Vec<(&'static str, &'static str, SignalCb)>>,
+    out: AsyncQueue<Vec<u8>>,
+    tasks: Cell<Option<(SpawnedFuture<()>, SpawnedFuture<()>)>>,
+    pub unique_name: RefCell<String>,
+    /// probe-only byte transcript
+    dump: RefCell<Option<std::fs::File>>,
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+const AUTH_BURST: &[u8] = b"\0AUTH EXTERNAL\r\nDATA\r\nNEGOTIATE_UNIX_FD\r\nBEGIN\r\n";
+
+fn system_bus_path() -> Result<String, DbusError> {
+    match std::env::var("DBUS_SYSTEM_BUS_ADDRESS") {
+        Ok(addr) => {
+            // first entry only; strip trailing ,guid=...
+            let first = addr.split(';').next().unwrap_or("");
+            let Some(rest) = first.strip_prefix("unix:path=") else {
+                return Err(DbusError::Env(
+                    "DBUS_SYSTEM_BUS_ADDRESS is not a unix:path= address",
+                ));
+            };
+            Ok(rest.split(',').next().unwrap_or(rest).to_string())
+        }
+        Err(_) => Ok("/var/run/dbus/system_bus_socket".to_string()),
+    }
+}
+
+impl DbusConn {
+    pub async fn connect(eng: &Rc<Engine>, ring: &Rc<Ring>) -> Result<Rc<DbusConn>, DbusError> {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, socket_with};
+        let path = system_bus_path()?;
+        let fd = socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(DbusError::Connect)?;
+        let addr = SocketAddrUnix::new(&*path).map_err(DbusError::Connect)?;
+        rustix::net::connect(&fd, &addr).map_err(DbusError::Connect)?;
+        let fd = Rc::new(fd);
+
+        let leftover = auth(ring, &fd).await?;
+
+        let conn = Rc::new(DbusConn {
+            ring: ring.clone(),
+            fd,
+            serial: NumCell::new(1),
+            closed: Cell::new(false),
+            replies: RefCell::new(HashMap::new()),
+            signal_handlers: RefCell::new(Vec::new()),
+            out: AsyncQueue::default(),
+            tasks: Cell::new(None),
+            unique_name: RefCell::new(String::new()),
+            dump: RefCell::new(None),
+        });
+        let c = conn.clone();
+        let incoming = eng.spawn("dbus in", async move {
+            let res = c.incoming_loop(leftover).await;
+            if let Err(e) = res {
+                eprintln!("carrot: dbus connection lost: {e}");
+            }
+            c.fail_all(DbusError::Closed);
+        });
+        let c = conn.clone();
+        let outgoing = eng.spawn("dbus out", async move {
+            let _ = c.outgoing_loop().await;
+        });
+        conn.tasks.set(Some((incoming, outgoing)));
+
+        let hello = conn
+            .call(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "Hello",
+                "",
+                &[],
+            )
+            .await?;
+        if hello.sig != "s" {
+            return Err(DbusError::BadReply("Hello"));
+        }
+        *conn.unique_name.borrow_mut() = hello.rd().str()?;
+        Ok(conn)
+    }
+
+    fn next_serial(&self) -> u32 {
+        (self.serial.fetch_add(1) & 0xffff_ffff) as u32
+    }
+
+    fn build(
+        &self,
+        serial: u32,
+        flags: u8,
+        dest: &str,
+        path: &str,
+        iface: &str,
+        member: &str,
+        sig: &str,
+        args: &[Arg<'_>],
+    ) -> Vec<u8> {
+        let mut b = MsgBuilder::call(serial, flags);
+        b.path(path);
+        b.destination(dest);
+        b.interface(iface);
+        b.member(member);
+        if !sig.is_empty() {
+            b.signature(sig);
+        }
+        b.finish_header();
+        for a in args {
+            match a {
+                Arg::U32(v) => b.put_u32(*v),
+                Arg::Str(v) => b.put_str(v),
+                Arg::Bool(v) => b.put_bool(*v),
+            }
+        }
+        b.finish()
+    }
+
+    pub async fn call(
+        &self,
+        dest: &str,
+        path: &str,
+        iface: &str,
+        member: &str,
+        sig: &str,
+        args: &[Arg<'_>],
+    ) -> Result<Reply, DbusError> {
+        if self.closed.get() {
+            return Err(DbusError::Closed);
+        }
+        let serial = self.next_serial();
+        let pending = Rc::new(PendingReply {
+            done: AsyncEvent::default(),
+            result: Cell::new(None),
+        });
+        self.replies.borrow_mut().insert(serial, pending.clone());
+        self.out
+            .push(self.build(serial, 0, dest, path, iface, member, sig, args));
+        pending.done.triggered().await;
+        pending.result.take().unwrap_or(Err(DbusError::Closed))
+    }
+
+    pub fn call_noreply(
+        &self,
+        dest: &str,
+        path: &str,
+        iface: &str,
+        member: &str,
+        sig: &str,
+        args: &[Arg<'_>],
+    ) {
+        if self.closed.get() {
+            return;
+        }
+        let serial = self.next_serial();
+        self.out.push(self.build(
+            serial,
+            wire::NO_REPLY_EXPECTED,
+            dest,
+            path,
+            iface,
+            member,
+            sig,
+            args,
+        ));
+    }
+
+    // handler first, then the bus-side match, so nothing slips between
+    pub async fn subscribe(
+        &self,
+        iface: &'static str,
+        member: &'static str,
+        sender: &str,
+        path: &str,
+        cb: SignalCb,
+    ) -> Result<(), DbusError> {
+        self.signal_handlers.borrow_mut().push((iface, member, cb));
+        let rule = format!(
+            "type='signal',interface='{iface}',member='{member}',sender='{sender}',path='{path}'"
+        );
+        self.call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "AddMatch",
+            "s",
+            &[Arg::Str(&rule)],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub fn set_dump(&self, f: std::fs::File) {
+        *self.dump.borrow_mut() = Some(f);
+    }
+
+    pub(super) fn dump_line(&self, line: &str) {
+        if let Some(f) = self.dump.borrow_mut().as_mut() {
+            use std::io::Write;
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
+        }
+    }
+
+    async fn incoming_loop(&self, leftover: Vec<u8>) -> Result<(), DbusError> {
+        let mut pending = leftover;
+        let mut fdq: VecDeque<Rc<OwnedFd>> = VecDeque::new();
+        let mut buf = vec![0u8; 4096];
+        if !pending.is_empty() {
+            self.dump_line(&format!("RX leftover {} {}", pending.len(), hex(&pending)));
+        }
+        loop {
+            let res = self.drain_messages(&mut pending, &mut fdq);
+            if let Err(e) = &res {
+                self.dump_line(&format!("DRAIN ERR {e}"));
+            }
+            res?;
+            let r = self.ring.recvmsg(&self.fd, buf, 0).await?;
+            if r.truncated {
+                return Err(DbusError::Malformed("fd control data truncated"));
+            }
+            if r.n == 0 {
+                self.dump_line("RX eof");
+                return Err(DbusError::Closed);
+            }
+            self.dump_line(&format!(
+                "RX {} fds={} {}",
+                r.n,
+                r.fds.len(),
+                hex(&r.buf[..r.n])
+            ));
+            pending.extend_from_slice(&r.buf[..r.n]);
+            fdq.extend(r.fds.into_iter().map(Rc::new));
+            buf = r.buf;
+        }
+    }
+
+    fn drain_messages(
+        &self,
+        pending: &mut Vec<u8>,
+        fdq: &mut VecDeque<Rc<OwnedFd>>,
+    ) -> Result<(), DbusError> {
+        while let Some(len) = wire::message_len(pending) {
+            if pending.len() < len {
+                break;
+            }
+            let msg: Vec<u8> = pending.drain(..len).collect();
+            let h = wire::parse(&msg)?;
+            self.dump_line(&format!(
+                "MSG type={} serial={} reply_to={:?} sig={:?} fds={} err={:?} member={:?}",
+                h.mtype, h.serial, h.reply_serial, h.signature, h.unix_fds, h.error_name, h.member
+            ));
+            let nfds = h.unix_fds as usize;
+            if fdq.len() < nfds {
+                return Err(DbusError::TooFewFds);
+            }
+            let fds: Vec<Rc<OwnedFd>> = fdq.drain(..nfds).collect();
+            let body = msg[h.body.0..h.body.1].to_vec();
+            match h.mtype {
+                wire::METHOD_RETURN => {
+                    if let Some(serial) = h.reply_serial {
+                        match self.replies.borrow_mut().remove(&serial) {
+                            Some(p) => {
+                                p.result.set(Some(Ok(Reply {
+                                    sig: h.signature,
+                                    body,
+                                    fds,
+                                })));
+                                p.done.trigger();
+                            }
+                            None => {
+                                self.dump_line(&format!("RETURN for unknown serial {serial}"))
+                            }
+                        }
+                    }
+                }
+                wire::ERROR => {
+                    if let Some(serial) = h.reply_serial {
+                        if let Some(p) = self.replies.borrow_mut().remove(&serial) {
+                            let text = if h.signature.starts_with('s') {
+                                Rd::new(&body, &[]).str().unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            p.result.set(Some(Err(DbusError::Call {
+                                name: h.error_name.unwrap_or_default(),
+                                text,
+                            })));
+                            p.done.trigger();
+                        }
+                    }
+                }
+                wire::SIGNAL => {
+                    let (Some(iface), Some(member)) = (&h.interface, &h.member) else {
+                        continue;
+                    };
+                    let sm = SignalMsg {
+                        path: h.path,
+                        sig: h.signature,
+                        body,
+                        fds,
+                    };
+                    for (i, m, cb) in self.signal_handlers.borrow().iter() {
+                        if *i == iface && *m == member {
+                            cb(&sm);
+                        }
+                    }
+                }
+                // client-only: logind never sends inbound calls; drop them
+                _ => crate::trace!("ignoring dbus message type {}", h.mtype),
+            }
+        }
+        Ok(())
+    }
+
+    async fn outgoing_loop(&self) -> Result<(), DbusError> {
+        loop {
+            let msg = self.out.pop().await;
+            self.dump_line(&format!("TX {} {}", msg.len(), hex(&msg)));
+            let len = msg.len();
+            let mut sent = 0;
+            let mut buf = msg;
+            while sent < len {
+                let (b, n) = self
+                    .ring
+                    .sendmsg(&self.fd, buf, (sent, len), Vec::new(), None)
+                    .await?;
+                buf = b;
+                sent += n;
+            }
+        }
+    }
+
+    fn fail_all(&self, _e: DbusError) {
+        self.closed.set(true);
+        for (_, p) in self.replies.borrow_mut().drain() {
+            p.result.set(Some(Err(DbusError::Closed)));
+            p.done.trigger();
+        }
+    }
+
+    /// break the task<->conn cycle; idempotent
+    pub fn clear(&self) {
+        self.closed.set(true);
+        self.tasks.take();
+        self.signal_handlers.borrow_mut().clear();
+        self.fail_all(DbusError::Closed);
+    }
+}
+
+pub fn probe() -> i32 {
+    logind::probe()
+}
+
+async fn auth(ring: &Rc<Ring>, fd: &Rc<OwnedFd>) -> Result<Vec<u8>, DbusError> {
+    let mut buf = AUTH_BURST.to_vec();
+    let len = buf.len();
+    let mut sent = 0;
+    while sent < len {
+        let (b, n) = ring.sendmsg(fd, buf, (sent, len), Vec::new(), None).await?;
+        buf = b;
+        sent += n;
+    }
+
+    // three lines back: DATA, OK <guid>, AGREE_UNIX_FD. bytes after the
+    // third line are binary and belong to the message stream.
+    let mut acc: Vec<u8> = Vec::new();
+    let mut lines = 0;
+    let mut consumed = 0;
+    let mut read_buf = vec![0u8; 256];
+    loop {
+        while lines < 3 {
+            let Some(nl) = acc[consumed..].iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let line = &acc[consumed..consumed + nl];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let word = line.split(|&b| b == b' ').next().unwrap_or(b"");
+            match (lines, word) {
+                (0, b"DATA") | (1, b"OK") | (2, b"AGREE_UNIX_FD") => lines += 1,
+                (0, _) => return Err(DbusError::Auth("DATA")),
+                (1, _) => return Err(DbusError::Auth("OK")),
+                _ => return Err(DbusError::Auth("AGREE_UNIX_FD")),
+            }
+            consumed += nl + 1;
+        }
+        if lines == 3 {
+            return Ok(acc[consumed..].to_vec());
+        }
+        let (b, n) = ring.read(fd, read_buf).await?;
+        if n == 0 {
+            return Err(DbusError::Auth("more auth data"));
+        }
+        acc.extend_from_slice(&b[..n]);
+        read_buf = b;
+    }
+}
