@@ -48,6 +48,9 @@ fn main() {
     if std::env::args().any(|a| a == "render-probe") {
         std::process::exit(render::renderer::probe());
     }
+    if std::env::args().any(|a| a == "input-probe") {
+        std::process::exit(input::probe());
+    }
 
     if let Err(e) = run() {
         eprintln!("carrot: fatal: {e}");
