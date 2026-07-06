@@ -57,7 +57,7 @@ A pure Rust tiling Wayland compositor with a Vulkan rendering pipeline. Carrot a
 - **Launch-to-workspace** - spawn windows on any workspace without the need of switching to it first
 
 ### Integration
-- **XWayland** support via an in-house X window manager - no external tools
+- **XWayland** support via [xwayland-satellite](https://github.com/Supreeeme/xwayland-satellite)
 - `ext-idle-notify-v1` for idle/lock management
 - `wlr-layer-shell` for panels, overlays, and lock screens
 - `wlr-foreign-toplevel-management` for taskbars and window switchers
@@ -68,8 +68,6 @@ A pure Rust tiling Wayland compositor with a Vulkan rendering pipeline. Carrot a
 ## Configuration
 
 Carrot uses [KDL](https://kdl.dev) for configuration, with full NixOS and Home Manager module integration.
-
-Lua configuration is also officially supported as an opt-in alternative - KDL stays the default. It's a runtime switch (no rebuild needed), and on NixOS / Home Manager you declare it through the module.
 
 ```kdl
 general {
@@ -123,7 +121,6 @@ programs.carrot.enable = true;
 # Home Manager module
 wayland.windowManager.carrot = {
   enable = true;
-  configFormat = "lua"; # optional, defaults to "kdl"
   settings = {
     general = {
       layout = "dwindle";
@@ -153,7 +150,7 @@ nix build github:flammablebunny/carrot
 cargo build --release
 ```
 
-System dependencies: `vulkan-loader` (loaded at runtime, never linked) - that's the whole list. **Carrot links zero C libraries**.
+System dependencies: `vulkan-loader`, `libdrm`, `libinput`, `libseat`, `libxkbcommon`, `wayland-protocols`
 
 ## Acknowledgments
 
