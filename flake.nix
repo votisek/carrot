@@ -37,55 +37,33 @@
           # Only include source files that are actually relevant to the build
           src = lib.cleanSourceWith {
             src = ./.;
-            filter = path: type:
-              (craneLib.filterCargoSources path type)
-              # Include protocol XML files if we vendor them
-              || (lib.hasSuffix ".xml" path);
+            filter = craneLib.filterCargoSources;
           };
 
+          # Pure Rust, zero linked C: nothing to build against. The Vulkan
+          # loader is dlopened at runtime and xkb data is read at runtime,
+          # so both are wrapper concerns, not build inputs.
           commonArgs = {
             inherit src;
             pname = "carrot";
             version = "0.1.0";
+            strictDeps = true;
 
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-              wayland-scanner
-            ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
 
-            buildInputs = with pkgs; [
-              # Vulkan
-              vulkan-loader
-              vulkan-headers
-
-              # Wayland
-              wayland
-              wayland-protocols
-
-              # DRM/KMS
-              libdrm
-
-              # Input
-              libinput
-              seatd
-
-              # Keymap
-              libxkbcommon
-
-              # Misc
-              pixman
-              udev
-            ];
-
-            # Vulkan needs to be able to find the ICD at runtime
-            LD_LIBRARY_PATH = lib.makeLibraryPath [ pkgs.vulkan-loader ];
+            # the keymap tests build real xkb state in the check phase
+            XKB_CONFIG_ROOT = "${pkgs.xkeyboard-config}/share/X11/xkb";
           };
 
           carrot = craneLib.buildPackage (commonArgs // {
             cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-            # TODO: add session entry, portal config, etc
+            # TODO: portal config, etc
             postInstall = ''
+              wrapProgram $out/bin/carrot \
+                --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.vulkan-loader ]} \
+                --set-default XKB_CONFIG_ROOT ${pkgs.xkeyboard-config}/share/X11/xkb
+
               # Wayland session desktop entry
               mkdir -p $out/share/wayland-sessions
               cat > $out/share/wayland-sessions/carrot.desktop << EOF
