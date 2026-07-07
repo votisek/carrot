@@ -406,6 +406,27 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface zwlr_screencopy_manager_v1, version = 3;
+    request capture_output(frame: new_id, overlay_cursor: int, output: object);
+    request capture_output_region(frame: new_id, overlay_cursor: int, output: object, x: int, y: int, width: int, height: int);
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface zwlr_screencopy_frame_v1, version = 3;
+    request copy(buffer: object);
+    request destroy();
+    request copy_with_damage(buffer: object) since 2;
+    event buffer(format: uint, width: uint, height: uint, stride: uint);
+    event flags(flags: uint);
+    event ready(tv_sec_hi: uint, tv_sec_lo: uint, tv_nsec: uint);
+    event failed();
+    event damage(x: uint, y: uint, width: uint, height: uint) since 2;
+    event linux_dmabuf(format: uint, width: uint, height: uint) since 3;
+    event buffer_done() since 3;
+}
+
+crate::wl_protocol! {
     interface zwlr_foreign_toplevel_manager_v1, version = 3;
     request stop();
     event toplevel(toplevel: new_id);
@@ -656,6 +677,8 @@ mod tests {
         assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
         assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
         assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
+        assert_eq!(zwlr_screencopy_frame_v1::copy_with_damage::OPCODE, 2);
+        assert_eq!(zwlr_screencopy_frame_v1::buffer_done::OPCODE, 6);
         assert_eq!(zwlr_foreign_toplevel_handle_v1::activate::OPCODE, 4);
         assert_eq!(zwlr_foreign_toplevel_handle_v1::close::OPCODE, 5);
         assert_eq!(zwlr_foreign_toplevel_handle_v1::closed::OPCODE, 6);

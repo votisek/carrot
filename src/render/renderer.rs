@@ -772,6 +772,116 @@ impl Renderer {
         Ok(())
     }
 
+    /// render ops into an offscreen image and read the pixels back as tightly
+    /// packed rows. screenshot-grade: fully synchronous.
+    pub fn read_frame(
+        &self,
+        w: u32,
+        h: u32,
+        ops: &[RenderOp],
+        waits: Vec<vk::Semaphore>,
+    ) -> Result<Vec<u8>, RenderError> {
+        let dev = &self.core.device;
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(self.format)
+            .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { dev.create_image(&info, None) }?;
+        let img_guard = crate::util::OnDrop(|| unsafe { dev.destroy_image(image, None) });
+        let reqs = unsafe { dev.get_image_memory_requirements(image) };
+        let mem_type = self
+            .core
+            .find_memory_type(reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(mem_type);
+        let memory = unsafe { dev.allocate_memory(&alloc, None) }?;
+        let mem_guard = crate::util::OnDrop(|| unsafe { dev.free_memory(memory, None) });
+        unsafe { dev.bind_image_memory(image, memory, 0) }?;
+        let view = self.create_target_view(image)?;
+        let view_guard = crate::util::OnDrop(|| unsafe { dev.destroy_image_view(view, None) });
+
+        let target = FrameTarget {
+            image,
+            view,
+            width: w,
+            height: h,
+            undefined: true,
+        };
+        let frame = self.render(&target, Some([0.0, 0.0, 0.0, 1.0]), ops, waits)?;
+        frame.wait(self)?;
+
+        // staging buffer, host visible
+        let size = (w as u64) * (h as u64) * 4;
+        let binfo = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { dev.create_buffer(&binfo, None) }?;
+        let buf_guard = crate::util::OnDrop(|| unsafe { dev.destroy_buffer(buffer, None) });
+        let breqs = unsafe { dev.get_buffer_memory_requirements(buffer) };
+        let btype = self.core.find_memory_type(
+            breqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let balloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(breqs.size)
+            .memory_type_index(btype);
+        let bmem = unsafe { dev.allocate_memory(&balloc, None) }?;
+        let bmem_guard = crate::util::OnDrop(|| unsafe { dev.free_memory(bmem, None) });
+        unsafe { dev.bind_buffer_memory(buffer, bmem, 0) }?;
+
+        // one-shot copy; render released the target to GENERAL
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .queue_family_index(self.core.queue_family);
+        let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
+        let pool_guard = crate::util::OnDrop(|| unsafe { dev.destroy_command_pool(pool, None) });
+        let cba = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { dev.allocate_command_buffers(&cba) }?[0];
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            dev.begin_command_buffer(cb, &begin)?;
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+            dev.cmd_copy_image_to_buffer(cb, image, vk::ImageLayout::GENERAL, buffer, &[region]);
+            dev.end_command_buffer(cb)?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            dev.queue_submit(self.core.queue, &[submit], vk::Fence::null())?;
+            dev.queue_wait_idle(self.core.queue)?;
+        }
+
+        let mut out = vec![0u8; size as usize];
+        unsafe {
+            let ptr = dev.map_memory(bmem, 0, size, vk::MemoryMapFlags::empty())?;
+            std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), out.as_mut_ptr(), size as usize);
+            dev.unmap_memory(bmem);
+        }
+        drop(pool_guard);
+        drop(bmem_guard);
+        drop(buf_guard);
+        drop(view_guard);
+        drop(mem_guard);
+        drop(img_guard);
+        Ok(out)
+    }
+
     /// blocking staging upload; `fill` writes tightly packed rows into the
     /// staging slice. bring-up grade.
     pub fn upload_texture(

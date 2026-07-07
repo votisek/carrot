@@ -13,6 +13,7 @@ pub mod output;
 pub mod pointer_constraints;
 pub mod primary_selection;
 pub mod relative_pointer;
+pub mod screencopy;
 pub mod shm;
 pub mod tearing;
 pub mod wire;

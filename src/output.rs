@@ -861,6 +861,46 @@ fn draw_buffer(
     });
 }
 
+/// (slot, width, height) of the output a capture targets; single output
+/// for now, so the wl_output argument is resolved to slot 0
+pub fn output_geometry(state: &Rc<State>) -> Option<(usize, u32, u32)> {
+    let d = state.display.borrow();
+    let out = &d.as_ref()?.out;
+    Some((0, out.width, out.height))
+}
+
+/// compose the output and read the pixels back, then crop to the region.
+/// rows come back tightly packed (stride = region width * 4)
+pub fn screencopy(state: &Rc<State>, _out_index: usize, region: Rect) -> Option<Vec<u8>> {
+    let out = {
+        let d = state.display.borrow();
+        d.as_ref()?.out.clone()
+    };
+    let ops = compose(state, &out);
+    let mut waits = Vec::new();
+    for fence in out.frame_fences.borrow_mut().drain(..) {
+        if let Ok(sem) = out.renderer.import_wait(fence) {
+            waits.push(sem);
+        }
+    }
+    let full = match out.renderer.read_frame(out.width, out.height, &ops, waits) {
+        Ok(px) => px,
+        Err(e) => {
+            eprintln!("carrot: screencopy render failed: {e}");
+            return None;
+        }
+    };
+    let (rw, rh) = (region.width() as usize, region.height() as usize);
+    let (ox, oy) = (region.x1 as usize, region.y1 as usize);
+    let src_stride = out.width as usize * 4;
+    let mut px = vec![0u8; rw * rh * 4];
+    for row in 0..rh {
+        let s0 = (oy + row) * src_stride + ox * 4;
+        px[row * rw * 4..][..rw * 4].copy_from_slice(&full[s0..s0 + rw * 4]);
+    }
+    Some(px)
+}
+
 /// four fills just outside the window box
 fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Vec<RenderOp>) {
     let sides = [

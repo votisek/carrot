@@ -170,6 +170,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(protocol::foreign_toplevel::ForeignToplevelGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::screencopy::ScreencopyManagerGlobal));
     let st = state.clone();
     let configure_pump = engine.spawn("configure pump", async move {
         shell::xdg::configure_loop(st).await;
