@@ -31,6 +31,7 @@ mod config;
 mod dbus;
 mod input;
 mod ipc;
+mod sighand;
 mod tree;
 mod xwayland;
 
@@ -65,6 +66,9 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // mask first: every thread spawned later inherits it, so int/term can
+    // only ever land on the signalfd
+    let sig_fd = sighand::install()?;
     let engine = engine::Engine::new();
     let ring = uring::Ring::new(&engine, 32)?;
     let wheel = engine::Wheel::new(&engine, &ring)?;
@@ -74,6 +78,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("listening on {}", sock.name);
     let cpu = cpu_worker::CpuWorker::new(&engine, &ring)?;
     let state = state::State::new(&engine, &ring, wheel);
+    let sig_task = sighand::run(&state, sig_fd);
     state.globals.add(std::rc::Rc::new(surface::WlCompositorGlobal));
     state.globals.add(std::rc::Rc::new(surface::WlSubcompositorGlobal));
     state.globals.add(std::rc::Rc::new(protocol::shm::WlShmGlobal));
@@ -195,6 +200,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(bring_up);
     drop(configure_pump);
     drop(xwayland_task);
+    drop(sig_task);
     drop(ipc);
     state.clear();
     drop(cpu);

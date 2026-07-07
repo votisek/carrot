@@ -363,6 +363,7 @@ async fn run_one(state: &Rc<State>, xw: &Rc<Xwayland>, claim: &DisplayClaim) -> 
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(move || {
+            crate::sighand::unblock_all_in_child();
             // two phases so a source sitting on 3..6 can't get clobbered
             let mut high = [0i32; 4];
             for (i, src) in srcs.iter().enumerate() {

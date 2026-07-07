@@ -188,6 +188,7 @@ fn spawn(state: &Rc<State>, cmd: &str) {
     }
     unsafe {
         c.pre_exec(|| {
+            crate::sighand::unblock_all_in_child();
             let _ = rustix::process::setsid();
             Ok(())
         });
