@@ -118,7 +118,10 @@ struct Output {
     front: Cell<usize>,
     width: u32,
     height: u32,
-    textures: RefCell<HashMap<(ClientId, ObjectId), Texture>>,
+    /// keyed by surface uid; the u64 is the content_gen the texture holds
+    textures: RefCell<HashMap<(ClientId, u64), (Texture, u64)>>,
+    /// evicted textures still in a submitted frame; drained past the fence
+    retired_tex: RefCell<Vec<Texture>>,
     /// card's dev_t, matches logind pause/resume signals
     devnum: u64,
     /// vt elsewhere; render but never commit until resume
@@ -378,6 +381,7 @@ async fn init_card(
         width,
         height,
         textures: RefCell::new(HashMap::new()),
+        retired_tex: RefCell::new(Vec::new()),
         devnum,
         paused: Cell::new(false),
         cursor_locked: Cell::new(false),
@@ -463,6 +467,10 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             let _ = state.ring.readable(&fd).await;
         }
         out.renderer.recycle_frame(frame);
+        // the frame that referenced these has now scanned out
+        for t in out.retired_tex.borrow_mut().drain(..) {
+            out.renderer.destroy_texture(&t);
+        }
         let ms = (Time::now().nsec() / 1_000_000) as u32;
         state.clients.for_each(|c| {
             c.objects.for_each_surface(|s| {
@@ -480,7 +488,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
 /// sit above their window.
 fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     let mut ops = Vec::new();
-    let mut live: Vec<(ClientId, ObjectId)> = Vec::new();
+    let mut live: Vec<(ClientId, u64)> = Vec::new();
     let ws = crate::tree::active(state);
     let focused = state
         .seat
@@ -491,7 +499,7 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     let screen = Rect::new_sized_saturating(0, 0, out.width as i32, out.height as i32);
     let cfg = state.config.borrow().clone();
 
-    let draw = |win: &Rc<crate::tree::Window>, ops: &mut Vec<RenderOp>, live: &mut Vec<(ClientId, ObjectId)>| {
+    let draw = |win: &Rc<crate::tree::Window>, ops: &mut Vec<RenderOp>, live: &mut Vec<(ClientId, u64)>| {
         let surface = win.surface();
         if !surface.mapped.get() {
             return;
@@ -537,7 +545,8 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     }
     draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live);
 
-    // textures for gone buffers don't outlive the frame
+    // a surface gone from the scene keeps its texture until the frame
+    // that referenced it clears the fence
     let mut textures = out.textures.borrow_mut();
     let stale: Vec<_> = textures
         .keys()
@@ -545,8 +554,8 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
         .copied()
         .collect();
     for k in stale {
-        if let Some(t) = textures.remove(&k) {
-            out.renderer.destroy_texture(&t);
+        if let Some((t, _)) = textures.remove(&k) {
+            out.retired_tex.borrow_mut().push(t);
         }
     }
     ops
@@ -560,7 +569,7 @@ fn draw_surface_tree(
     y: i32,
     clip: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, ObjectId)>,
+    live: &mut Vec<(ClientId, u64)>,
 ) {
     if !surface.mapped.get() {
         return;
@@ -599,7 +608,7 @@ fn draw_popup(
     oy: i32,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, ObjectId)>,
+    live: &mut Vec<(ClientId, u64)>,
 ) {
     if !p.xdg.surface.mapped.get() {
         return;
@@ -619,7 +628,7 @@ fn draw_popups(
     oy: i32,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, ObjectId)>,
+    live: &mut Vec<(ClientId, u64)>,
 ) {
     xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, ops, live));
 }
@@ -631,7 +640,7 @@ fn draw_layer(
     layer: u32,
     screen: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, ObjectId)>,
+    live: &mut Vec<(ClientId, u64)>,
 ) {
     let layers = state.layers.borrow().clone();
     for ls in layers.iter() {
@@ -653,7 +662,7 @@ fn draw_buffer(
     y: i32,
     clip: Rect,
     ops: &mut Vec<RenderOp>,
-    live: &mut Vec<(ClientId, ObjectId)>,
+    live: &mut Vec<(ClientId, u64)>,
 ) {
     let buffer = s.buffer.borrow();
     let Some(att) = buffer.as_ref() else { return };
@@ -662,21 +671,22 @@ fn draw_buffer(
     if bw == 0 || bh == 0 {
         return;
     }
-    let key = (s.client.id, buf.id);
+    let key = (s.client.id, s.uid);
     let opaque = !buf.format.has_alpha();
     {
         let mut textures = out.textures.borrow_mut();
         let need_new = match textures.get(&key) {
-            Some(t) => t.width != bw || t.height != bh,
+            Some((t, _)) => t.width != bw || t.height != bh,
             None => true,
         };
         if need_new {
-            if let Some(old) = textures.remove(&key) {
-                out.renderer.destroy_texture(&old);
+            if let Some((old, _)) = textures.remove(&key) {
+                out.retired_tex.borrow_mut().push(old);
             }
             match out.renderer.create_texture(bw, bh, opaque) {
                 Ok(t) => {
-                    textures.insert(key, t);
+                    // gen behind the surface's so the first pass uploads
+                    textures.insert(key, (t, s.content_gen.get().wrapping_sub(1)));
                 }
                 Err(e) => {
                     eprintln!("carrot: texture alloc failed: {e}");
@@ -684,34 +694,60 @@ fn draw_buffer(
                 }
             }
         }
-        let tex = textures.get(&key).unwrap();
-        let stride = buf.stride as usize;
-        let row = (bw * 4) as usize;
-        let res = out.renderer.upload_texture(tex, |dst| match buf.access() {
-            ShmAccess::Ptr(p) => {
-                for yy in 0..bh as usize {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            p.add(yy * stride),
-                            dst[yy * row..].as_mut_ptr(),
-                            row,
-                        );
+        // the pixels only move on commit; a compose over an unchanged
+        // surface just re-samples the texture it already has
+        let cur = s.content_gen.get();
+        let entry = textures.get_mut(&key).unwrap();
+        if entry.1 != cur {
+            let shadow = s.shm_shadow.borrow();
+            let row = (bw * 4) as usize;
+            let need = row * bh as usize;
+            let stride = buf.stride as usize;
+            let res = if let Some(px) = shadow.as_ref().filter(|p| p.len() >= need) {
+                // the commit-time shadow is the source of truth
+                out.renderer
+                    .upload_texture(&entry.0, |dst| dst[..need].copy_from_slice(&px[..need]))
+            } else {
+                // shadow missing (capture failed): fall back to the client
+                // buffer, zero-filling short rows instead of leaking staging
+                out.renderer.upload_texture(&entry.0, |dst| match buf.access() {
+                    ShmAccess::Ptr(p) => {
+                        for yy in 0..bh as usize {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    p.add(yy * stride),
+                                    dst[yy * row..].as_mut_ptr(),
+                                    row,
+                                );
+                            }
+                        }
                     }
-                }
+                    ShmAccess::Fd { fd, offset } => {
+                        for yy in 0..bh as usize {
+                            let dst = &mut dst[yy * row..yy * row + row];
+                            let mut done = 0;
+                            while done < row {
+                                match rustix::io::pread(
+                                    fd,
+                                    &mut dst[done..],
+                                    (offset + yy * stride + done) as u64,
+                                ) {
+                                    Ok(0) | Err(_) => {
+                                        dst[done..].fill(0);
+                                        break;
+                                    }
+                                    Ok(n) => done += n,
+                                }
+                            }
+                        }
+                    }
+                })
+            };
+            if let Err(e) = res {
+                eprintln!("carrot: upload failed: {e}");
+                return;
             }
-            ShmAccess::Fd { fd, offset } => {
-                for yy in 0..bh as usize {
-                    let _ = rustix::io::pread(
-                        fd,
-                        &mut dst[yy * row..yy * row + row],
-                        (offset + yy * stride) as u64,
-                    );
-                }
-            }
-        });
-        if let Err(e) = res {
-            eprintln!("carrot: upload failed: {e}");
-            return;
+            entry.1 = cur;
         }
     }
     live.push(key);
@@ -722,7 +758,7 @@ fn draw_buffer(
         return;
     }
     let textures = out.textures.borrow();
-    let tex = textures.get(&key).unwrap();
+    let (tex, _) = textures.get(&key).unwrap();
     let fx = |v: i32| v as f32 / out.width as f32 * 2.0 - 1.0;
     let fy = |v: i32| v as f32 / out.height as f32 * 2.0 - 1.0;
     ops.push(RenderOp::Tex {

@@ -129,6 +129,51 @@ impl PendingState {
     }
 }
 
+/// copies tight w*4 rows out of the client buffer. false = nothing captured,
+/// so the old shadow stays and the release falls to the drop-on-replace path
+fn capture_shadow(buf: &crate::protocol::shm::WlBuffer, slot: &mut Option<Vec<u8>>) -> bool {
+    use crate::clientmem::ShmAccess;
+    let (w, h) = (buf.rect.width() as usize, buf.rect.height() as usize);
+    let row = w * 4;
+    let need = row * h;
+    if need == 0 {
+        return false;
+    }
+    let stride = buf.stride as usize;
+    let px = slot.get_or_insert_with(Vec::new);
+    px.resize(need, 0);
+    match buf.access() {
+        ShmAccess::Ptr(p) => {
+            for yy in 0..h {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        p.add(yy * stride),
+                        px[yy * row..].as_mut_ptr(),
+                        row,
+                    );
+                }
+            }
+        }
+        ShmAccess::Fd { fd, offset } => {
+            for yy in 0..h {
+                let dst = &mut px[yy * row..yy * row + row];
+                let mut done = 0;
+                while done < row {
+                    // short reads zero-fill rather than leaking stale rows
+                    match rustix::io::pread(fd, &mut dst[done..], (offset + yy * stride + done) as u64) {
+                        Ok(0) | Err(_) => {
+                            dst[done..].fill(0);
+                            break;
+                        }
+                        Ok(n) => done += n,
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 impl WlSurface {
     pub(crate) fn commit_impl(&self) {
         {
@@ -177,6 +222,15 @@ impl WlSurface {
         if let Some(t) = pending.transform.take() {
             self.transform.set(t);
         }
+        // pixels only change on attach or damage; shm textures re-upload
+        // off content_gen, not every frame
+        let content_changed = pending.buffer.is_some()
+            || pending.damage_full
+            || !pending.surface_damage.is_empty()
+            || !pending.buffer_damage.is_empty();
+        if content_changed {
+            self.content_gen.set(self.content_gen.get().wrapping_add(1));
+        }
         if let Some(buf) = pending.buffer.take() {
             // dropping the previous attachment sends its release
             let old = self.buffer.borrow_mut().take();
@@ -188,6 +242,24 @@ impl WlSurface {
                 None => {
                     self.buf_x.set(0);
                     self.buf_y.set(0);
+                    self.shm_shadow.borrow_mut().take();
+                }
+            }
+        }
+        // shm pixels copy out here and the buffer releases right away -
+        // clients single-buffer instead of aging pools, and compositing
+        // reads the shadow, never client memory that may be rewritten
+        if content_changed {
+            let att = self.buffer.borrow();
+            if let Some(att) = att.as_ref() {
+                if capture_shadow(&att.buf, &mut self.shm_shadow.borrow_mut()) {
+                    att.send_release.set(false);
+                    if !att.buf.destroyed.get() {
+                        let b = &att.buf;
+                        b.client.event(|o| {
+                            crate::protocol::interfaces::wl_buffer::release::send(o, b.id)
+                        });
+                    }
                 }
             }
         }

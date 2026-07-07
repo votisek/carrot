@@ -91,6 +91,8 @@ pub struct WlSurface {
     pub id: ObjectId,
     pub client: Rc<Client>,
     pub version: u32,
+    /// never-reused identity; texture caches key on this, not the wire id
+    pub uid: u64,
     pub(crate) role: Cell<SurfaceRole>,
     pub(crate) ext: RefCell<Rc<dyn SurfaceExt>>,
     pub(crate) pending: RefCell<Box<PendingState>>,
@@ -109,6 +111,11 @@ pub struct WlSurface {
     pub(crate) extents: Cell<Rect>,
     pub(crate) frame_callbacks: RefCell<Vec<FrameCallback>>,
     pub(crate) children: RefCell<Option<Box<ParentData>>>,
+    /// bumps when a commit attaches or damages; shm re-uploads key off it
+    pub(crate) content_gen: Cell<u64>,
+    /// commit-time copy of the shm pixels (tight w*4 rows); the client
+    /// buffer releases immediately, so this is what compositing reads
+    pub(crate) shm_shadow: RefCell<Option<Vec<u8>>>,
     pub(crate) mapped: Cell<bool>,
     pub(crate) destroyed: Cell<bool>,
 }
@@ -119,6 +126,7 @@ impl WlSurface {
             id,
             client: client.clone(),
             version,
+            uid: client.state.next_uid(),
             role: Cell::new(SurfaceRole::None),
             ext: RefCell::new(Rc::new(NoneExt)),
             pending: RefCell::new(Box::default()),
@@ -134,6 +142,8 @@ impl WlSurface {
             extents: Cell::new(Rect::default()),
             frame_callbacks: RefCell::new(Vec::new()),
             children: RefCell::new(None),
+            content_gen: Cell::new(0),
+            shm_shadow: RefCell::new(None),
             mapped: Cell::new(false),
             destroyed: Cell::new(false),
         })
@@ -739,6 +749,29 @@ mod tests {
     }
 
     #[test]
+    fn content_gen_moves_on_attach_or_damage_only() {
+        let (_st, client, s) = setup();
+        let buf = test_buffer(&client, ObjectId(20), 8, 8);
+        let g0 = s.content_gen.get();
+        attach_commit(&s, buf.id);
+        let g1 = s.content_gen.get();
+        assert_ne!(g0, g1, "attach bumps");
+        // a bare commit leaves the pixels alone
+        s.commit(wl_surface::commit::Request {}).unwrap();
+        assert_eq!(s.content_gen.get(), g1, "empty commit holds");
+        // damage without a fresh attach still bumps
+        s.damage(wl_surface::damage::Request {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        })
+        .unwrap();
+        s.commit(wl_surface::commit::Request {}).unwrap();
+        assert_ne!(s.content_gen.get(), g1, "damage bumps");
+    }
+
+    #[test]
     fn mapping_follows_the_buffer() {
         let (_st, client, s) = setup();
         let buf = test_buffer(&client, ObjectId(20), 8, 8);
@@ -755,15 +788,20 @@ mod tests {
 
     #[test]
     fn release_contract() {
+        // shm releases at commit: pixels shadow out, the client buffer is
+        // free immediately and clients can single-buffer
         let (_st, client, s) = setup();
         let b1 = test_buffer(&client, ObjectId(20), 8, 8);
         let b2 = test_buffer(&client, ObjectId(21), 8, 8);
-        // replacement releases exactly the replaced buffer
         attach_commit(&s, b1.id);
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, b1.id, 0), 1, "released at commit");
+        assert!(s.shm_shadow.borrow().is_some(), "pixels shadowed");
+        // the replacement releases at its own commit; b1 owes nothing more
         attach_commit(&s, b2.id);
         let bytes = client.queued_out_bytes();
         assert_eq!(count_events(&bytes, b1.id, 0), 1);
-        assert_eq!(count_events(&bytes, b2.id, 0), 0);
+        assert_eq!(count_events(&bytes, b2.id, 0), 1);
         // a pending attach replaced before commit is never released
         let b3 = test_buffer(&client, ObjectId(22), 8, 8);
         s.attach(wl_surface::attach::Request { buffer: b3.id, x: 0, y: 0 }).unwrap();
@@ -771,12 +809,19 @@ mod tests {
         s.commit(wl_surface::commit::Request {}).unwrap();
         let bytes = client.queued_out_bytes();
         assert_eq!(count_events(&bytes, b3.id, 0), 0);
-        // one release per committed attach: recommitting b2 releases b2's prior attachment
-        assert_eq!(count_events(&bytes, b2.id, 0), 1);
-        // null attach releases the current attachment too
+        // every committed attach hands its content over and gets a release
+        assert_eq!(count_events(&bytes, b2.id, 0), 2);
+        // damage on the still-attached buffer re-captures and re-releases
+        s.damage(wl_surface::damage::Request { x: 0, y: 0, width: 4, height: 4 })
+            .unwrap();
+        s.commit(wl_surface::commit::Request {}).unwrap();
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, b2.id, 0), 3);
+        // null attach drops the shadow; nothing further to release
         attach_commit(&s, ObjectId::NONE);
         let bytes = client.queued_out_bytes();
-        assert_eq!(count_events(&bytes, b2.id, 0), 2);
+        assert_eq!(count_events(&bytes, b2.id, 0), 3);
+        assert!(s.shm_shadow.borrow().is_none());
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub struct State {
     /// ipc connections that asked for the event stream
     pub ipc_subs: RefCell<Vec<Rc<crate::ipc::Subscriber>>>,
     serial: NumCell<u64>,
+    /// identity for cache keys: wire ids get reused, uids never do
+    obj_uid: NumCell<u64>,
 }
 
 impl State {
@@ -70,6 +72,7 @@ impl State {
             xwayland: RefCell::new(None),
             ipc_subs: RefCell::new(Vec::new()),
             serial: NumCell::new(0),
+            obj_uid: NumCell::new(0),
         })
     }
 
@@ -79,6 +82,10 @@ impl State {
             c.track_serial(s);
         }
         s
+    }
+
+    pub fn next_uid(&self) -> u64 {
+        self.obj_uid.fetch_add(1) + 1
     }
 
     /// break the Rc cycles so everything frees. called once, after ring stop.
