@@ -27,6 +27,8 @@ pub struct PendingState {
     pub buffer_damage: Vec<Rect>,
     pub scale: Option<i32>,
     pub transform: Option<Transform>,
+    /// wp_tearing_control hint; Some(false) also carries the revert-on-destroy
+    pub tearing: Option<bool>,
     /// cached state of sync children, keyed by subsurface uid, not the reusable wire id
     pub subsurfaces: HashMap<u64, PendingSub>,
 }
@@ -68,6 +70,9 @@ impl PendingState {
         }
         if next.transform.is_some() {
             self.transform = next.transform.take();
+        }
+        if next.tearing.is_some() {
+            self.tearing = next.tearing.take();
         }
         self.frame_callbacks.append(&mut next.frame_callbacks);
         if next.damage_full {
@@ -125,6 +130,7 @@ impl PendingState {
         self.buffer_damage.clear();
         self.scale = None;
         self.transform = None;
+        self.tearing = None;
         self.subsurfaces.clear();
     }
 }
@@ -224,6 +230,9 @@ impl WlSurface {
         }
         if let Some(t) = pending.transform.take() {
             self.transform.set(t);
+        }
+        if let Some(t) = pending.tearing.take() {
+            self.tearing.set(t);
         }
         // pixels only change on attach or damage; shm textures re-upload
         // off content_gen, not every frame

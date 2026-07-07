@@ -116,6 +116,10 @@ pub struct WlSurface {
     /// commit-time copy of the shm pixels (tight w*4 rows); the client
     /// buffer releases immediately, so this is what compositing reads
     pub(crate) shm_shadow: RefCell<Option<Vec<u8>>>,
+    /// prefers async presentation (tearing) when it's the fullscreen surface
+    pub(crate) tearing: Cell<bool>,
+    /// a wp_tearing_control_v1 exists; the protocol allows exactly one
+    pub(crate) tearing_control: Cell<bool>,
     pub(crate) mapped: Cell<bool>,
     pub(crate) destroyed: Cell<bool>,
 }
@@ -144,6 +148,8 @@ impl WlSurface {
             children: RefCell::new(None),
             content_gen: Cell::new(0),
             shm_shadow: RefCell::new(None),
+            tearing: Cell::new(false),
+            tearing_control: Cell::new(false),
             mapped: Cell::new(false),
             destroyed: Cell::new(false),
         })

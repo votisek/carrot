@@ -372,6 +372,18 @@ crate::wl_protocol! {
     event failed();
 }
 
+crate::wl_protocol! {
+    interface wp_tearing_control_manager_v1, version = 1;
+    request destroy();
+    request get_tearing_control(id: new_id, surface: object);
+}
+
+crate::wl_protocol! {
+    interface wp_tearing_control_v1, version = 1;
+    request set_presentation_hint(hint: uint);
+    request destroy();
+}
+
 // wl_display.error codes
 pub const INVALID_OBJECT: u32 = 0;
 pub const INVALID_METHOD: u32 = 1;
@@ -544,6 +556,8 @@ mod tests {
         assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_formats::OPCODE, 5);
         assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_flags::OPCODE, 6);
         assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
+        assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
+        assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
     }
 
     /// byte-exact fixtures pin arg offsets and padding, not just opcodes

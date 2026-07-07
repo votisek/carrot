@@ -10,6 +10,7 @@ pub mod interfaces;
 pub mod output;
 pub mod primary_selection;
 pub mod shm;
+pub mod tearing;
 pub mod wire;
 
 use std::fmt;
