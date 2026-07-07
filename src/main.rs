@@ -54,6 +54,9 @@ fn main() {
     if std::env::args().any(|a| a == "input-probe") {
         std::process::exit(input::probe());
     }
+    if std::env::args().any(|a| a == "xcon-probe") {
+        std::process::exit(carrotconx::probe());
+    }
 
     if let Err(e) = run() {
         eprintln!("carrot: fatal: {e}");

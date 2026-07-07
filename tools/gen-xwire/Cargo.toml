@@ -1,0 +1,11 @@
+[package]
+name = "gen-xwire"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sha2 = "0.11"
+
+# standalone on purpose - carrot's build must never see this crate
+[workspace]
