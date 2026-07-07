@@ -373,6 +373,39 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface zwlr_data_control_manager_v1, version = 2;
+    request create_data_source(id: new_id);
+    request get_data_device(id: new_id, seat: object);
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface zwlr_data_control_device_v1, version = 2;
+    request set_selection(source: object);
+    request destroy();
+    request set_primary_selection(source: object) since 2;
+    event data_offer(id: new_id);
+    event selection(id: object);
+    event finished();
+    event primary_selection(id: object) since 2;
+}
+
+crate::wl_protocol! {
+    interface zwlr_data_control_source_v1, version = 1;
+    request offer(mime_type: string);
+    request destroy();
+    event send(mime_type: string, fd: fd);
+    event cancelled();
+}
+
+crate::wl_protocol! {
+    interface zwlr_data_control_offer_v1, version = 1;
+    request receive(mime_type: string, fd: fd);
+    request destroy();
+    event offer(mime_type: string);
+}
+
+crate::wl_protocol! {
     interface zwp_relative_pointer_manager_v1, version = 1;
     request destroy();
     request get_relative_pointer(id: new_id, pointer: object);
@@ -594,6 +627,9 @@ mod tests {
         assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
         assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
         assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
+        assert_eq!(zwlr_data_control_device_v1::set_primary_selection::OPCODE, 2);
+        assert_eq!(zwlr_data_control_device_v1::primary_selection::OPCODE, 3);
+        assert_eq!(zwlr_data_control_offer_v1::receive::OPCODE, 0);
         assert_eq!(zwp_relative_pointer_v1::relative_motion::OPCODE, 0);
         assert_eq!(zwp_pointer_constraints_v1::lock_pointer::OPCODE, 1);
         assert_eq!(zwp_pointer_constraints_v1::confine_pointer::OPCODE, 2);

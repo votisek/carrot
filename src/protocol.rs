@@ -2,6 +2,7 @@
 // interfaces, opcodes, stubs all generate from one declaration, requests and
 // events numbered separately. wl_array and fd args are first class.
 
+pub mod data_control;
 pub mod data_device;
 pub mod dmabuf;
 pub mod display;

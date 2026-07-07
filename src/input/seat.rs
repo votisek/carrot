@@ -49,6 +49,7 @@ pub struct SeatGlobal {
     // clipboard state rides on the seat: devices, sources, selection
     pub data: crate::protocol::data_device::DataDevices,
     pub primary: crate::protocol::primary_selection::PrimaryDevices,
+    pub data_control: crate::protocol::data_control::DataControl,
     // the popup grab chain, bottom first; keyboard focus to restore on
     // full dismissal
     pub popup_grab: RefCell<Vec<Rc<crate::shell::xdg::XdgPopup>>>,
@@ -79,6 +80,7 @@ impl SeatGlobal {
             last_press_serial: Cell::new(0),
             data: Default::default(),
             primary: Default::default(),
+            data_control: Default::default(),
             popup_grab: RefCell::new(Vec::new()),
             grab_prev_focus: RefCell::new(None),
             relative: RefCell::new(HashMap::new()),
@@ -152,6 +154,7 @@ impl SeatGlobal {
         self.bindings.borrow_mut().remove(&id);
         self.data.drop_client(id);
         self.primary.drop_client(id);
+        self.data_control.drop_client(id);
         self.popup_grab
             .borrow_mut()
             .retain(|p| p.client.id != id);

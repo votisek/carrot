@@ -339,6 +339,8 @@ impl DataDevices {
         if let Some(surface) = focused {
             self.offer_to(&surface.client);
         }
+        // windowless watchers hanging off wl_data_control
+        crate::protocol::data_control::selection_changed(state, false);
     }
 
     // a fresh wl_data_offer per data device, then selection(offer)

@@ -70,6 +70,8 @@ impl PrimaryDevices {
         if let Some(surface) = focused {
             self.offer_to(&surface.client);
         }
+        // windowless watchers track the primary selection too
+        crate::protocol::data_control::selection_changed(state, true);
     }
 
     pub fn offer_to(&self, client: &Rc<Client>) {
