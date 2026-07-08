@@ -46,6 +46,7 @@ pub struct SeatGlobal {
     ptr_buttons: RefCell<Vec<u32>>,
     /// serial of the most recent button press; drag/move grabs validate on it
     last_press_serial: Cell<u32>,
+    remap_held: RefCell<HashMap<u32, u32>>,
     // clipboard state rides on the seat: devices, sources, selection
     pub data: crate::protocol::data_device::DataDevices,
     pub primary: crate::protocol::primary_selection::PrimaryDevices,
@@ -78,6 +79,7 @@ impl SeatGlobal {
             ptr_origin: Cell::new((0, 0)),
             ptr_buttons: RefCell::new(Vec::new()),
             last_press_serial: Cell::new(0),
+            remap_held: RefCell::new(HashMap::new()),
             data: Default::default(),
             primary: Default::default(),
             data_control: Default::default(),
@@ -455,8 +457,45 @@ impl Object for WlPointer {
 
 impl SeatGlobal {
     /// one key edge: xkb, then binds, then the client
+    /// per-window key rebind, applied pre-xkb; press/release pair so a focus
+    /// change mid-hold can't strand a key down
+    fn remap(&self, state: &Rc<State>, key: u32, pressed: bool) -> u32 {
+        if !pressed {
+            if let Some(to) = self.remap_held.borrow_mut().remove(&key) {
+                return to;
+            }
+            return key;
+        }
+        let cfg = state.config.borrow().clone();
+        if cfg.remaps.is_empty() {
+            return key;
+        }
+        let focus = self.kb_focus.borrow().clone();
+        let Some(win) = focus.and_then(|s| crate::tree::window_for_surface(state, &s)) else {
+            return key;
+        };
+        let ws = state.active_ws.get() + 1;
+        let to = crate::config::resolve_remap(
+            &cfg,
+            &win.app_id(),
+            &win.title(),
+            win.x11_opt().is_some(),
+            win.surface().client.pid,
+            ws,
+            key,
+        );
+        match to {
+            Some(to) => {
+                self.remap_held.borrow_mut().insert(key, to);
+                to
+            }
+            None => key,
+        }
+    }
+
     pub fn key(&self, state: &Rc<State>, time_usec: u64, key: u32, pressed: bool) -> KeyAction {
         crate::protocol::idle::note_activity(state);
+        let key = self.remap(state, key, pressed);
         let changed = self
             .kb_state
             .borrow_mut()

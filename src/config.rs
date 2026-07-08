@@ -187,6 +187,66 @@ pub fn rule_effects(
     fx
 }
 
+/// a per-window key rebind profile: criteria AND, first match wins
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct RemapProfile {
+    pub name: String,
+    pub class: Option<String>,
+    pub title: Option<String>,
+    /// "x11" or "wayland"
+    pub win_type: Option<String>,
+    pub pid: Option<i32>,
+    /// 1-based, as written in config
+    pub workspace: Option<usize>,
+    /// evdev from -> to
+    pub maps: Vec<(u32, u32)>,
+}
+
+pub fn resolve_remap(
+    cfg: &Config,
+    class: &str,
+    title: &str,
+    is_x11: bool,
+    pid: i32,
+    ws_1based: usize,
+    key: u32,
+) -> Option<u32> {
+    for p in cfg.remaps.iter() {
+        if let Some(c) = &p.class {
+            if c != class {
+                continue;
+            }
+        }
+        if let Some(t) = &p.title {
+            if !title.contains(t.as_str()) {
+                continue;
+            }
+        }
+        if let Some(ty) = &p.win_type {
+            let want_x11 = ty == "x11";
+            if want_x11 != is_x11 {
+                continue;
+            }
+        }
+        if let Some(want) = p.pid {
+            if want != pid {
+                continue;
+            }
+        }
+        if let Some(want) = p.workspace {
+            if want != ws_1based {
+                continue;
+            }
+        }
+        for (from, to) in p.maps.iter() {
+            if *from == key {
+                return Some(*to);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct LayerRule {
     pub match_namespace: Option<String>,
@@ -236,6 +296,7 @@ pub struct Config {
     pub decoration: DecorationCfg,
     pub animations: AnimationsCfg,
     pub rules: Vec<WindowRule>,
+    pub remaps: Vec<RemapProfile>,
     pub layer_rules: Vec<LayerRule>,
     pub outputs: Vec<OutputCfg>,
     pub gpus: Vec<GpuCfg>,
@@ -285,6 +346,7 @@ impl Default for Config {
             decoration: DecorationCfg::default(),
             animations: AnimationsCfg::default(),
             rules: Vec::new(),
+            remaps: Vec::new(),
             layer_rules: Vec::new(),
             outputs: Vec::new(),
             gpus: Vec::new(),
@@ -459,10 +521,7 @@ pub fn parse(src: &str) -> Result<Config, String> {
                 cfg.submaps.push((name, binds));
                 unapplied.push("submap");
             }
-            "remap" => {
-                let name = first_str(node).unwrap_or_default();
-                eprintln!("carrot: config: remap \"{name}\" not implemented yet, ignored");
-            }
+            "remap" => cfg.remaps.push(parse_remap(node, src)?),
             other => return Err(at(node, src, &format!("unknown key \"{other}\""))),
         }
     }
@@ -642,6 +701,53 @@ fn parse_rule(node: &KdlNode, src: &str) -> Result<WindowRule, String> {
         return Err(at(node, src, "window-rule needs a match child"));
     }
     Ok(rule)
+}
+
+// remap "isaac" { class "..."; map "d" "left"; map "f" "space" }
+fn parse_remap(node: &KdlNode, src: &str) -> Result<RemapProfile, String> {
+    let mut p = RemapProfile {
+        name: first_str(node).unwrap_or_default(),
+        ..Default::default()
+    };
+    let Some(children) = node.children() else {
+        return Err(at(node, src, "remap needs a child block"));
+    };
+    for child in children.nodes() {
+        match child.name().value() {
+            "class" => p.class = Some(need_str(child, src)?),
+            "title" => p.title = Some(need_str(child, src)?),
+            "type" => {
+                let t = need_str(child, src)?;
+                if t != "x11" && t != "wayland" {
+                    return Err(at(child, src, "type is \"x11\" or \"wayland\""));
+                }
+                p.win_type = Some(t);
+            }
+            "pid" => p.pid = Some(need_int(child, src)?),
+            "workspace" => p.workspace = Some(need_int(child, src)?.max(1) as usize),
+            "map" => {
+                let args: Vec<String> = child
+                    .entries()
+                    .iter()
+                    .filter(|e| e.name().is_none())
+                    .filter_map(|e| e.value().as_string().map(str::to_string))
+                    .collect();
+                let [from, to] = args.as_slice() else {
+                    return Err(at(child, src, "map wants two key names"));
+                };
+                let f = keycode(&from.to_lowercase())
+                    .ok_or_else(|| at(child, src, &format!("unknown key \"{from}\"")))?;
+                let t = keycode(&to.to_lowercase())
+                    .ok_or_else(|| at(child, src, &format!("unknown key \"{to}\"")))?;
+                p.maps.push((f, t));
+            }
+            other => return Err(at(child, src, &format!("remap: unknown key \"{other}\""))),
+        }
+    }
+    if p.maps.is_empty() {
+        return Err(at(node, src, "remap has no map entries"));
+    }
+    Ok(p)
 }
 
 // layer-rule { match namespace="..."; blur #true; ignore-alpha 0.2 }
