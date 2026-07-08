@@ -118,10 +118,65 @@ pub async fn start(state: &Rc<State>, session: &Rc<LogindSession>) -> InputStack
     }
 }
 
+/// per-device knobs, re-resolved per event so config reloads apply live.
+/// deltas normalize to a 1000dpi baseline so accel-speed means the same
+/// on any device: dpi comes from udev's hwdb, the config key only
+/// overrides it. accel scales the cursor, not the raw relative deltas.
+fn device_factors(state: &Rc<State>, mgr: &evdev::Manager, devnum: u64) -> (f64, f64, bool, bool) {
+    let cfg = state.config.borrow().clone();
+    let mut speed = 0.0f64;
+    let mut dpi = 1000.0f64;
+    let mut natural = cfg.input.natural_scroll;
+    let mut adaptive = cfg.input.accel_profile.as_deref() == Some("adaptive");
+    if let Some(dev) = mgr.devices.borrow().iter().find(|d| d.devnum == devnum) {
+        dpi = dev.dpi;
+        let name: String = dev
+            .name
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c == ' ' || c == '_' { '-' } else { c })
+            .collect();
+        for r in cfg.devices.iter() {
+            if !r.name.is_empty() && name.contains(&r.name) {
+                if let Some(s) = r.accel_speed {
+                    speed = s;
+                }
+                if let Some(d) = r.dpi {
+                    if d > 0.0 {
+                        dpi = d;
+                    }
+                }
+                if let Some(n) = r.natural_scroll {
+                    natural = n;
+                }
+                if let Some(p) = &r.accel_profile {
+                    adaptive = p == "adaptive";
+                }
+            }
+        }
+    }
+    let scale = 1000.0 / dpi.max(1.0);
+    (speed.clamp(-1.0, 1.0), scale, natural, adaptive)
+}
+
+/// flat is a constant gain from accel-speed. adaptive shapes it: a
+/// precision zone below unity when slow, gain rising with speed to a cap;
+/// v is 1000dpi-normalized counts per ms
+fn accel_factor(speed: f64, adaptive: bool, v: f64) -> f64 {
+    let base = 1.0 + speed;
+    if !adaptive {
+        return base;
+    }
+    let t = (v / 4.0).min(1.0);
+    base * (0.6 + 1.4 * t)
+}
+
 /// device events into the seat; vt switch comes back out as an action
 async fn route_events(state: Rc<State>, mgr: Rc<evdev::Manager>, session: Rc<LogindSession>) {
+    // last motion time per device, for the adaptive velocity estimate
+    let mut last_motion: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     loop {
-        let (_, ev) = mgr.sink.pop().await;
+        let (devnum, ev) = mgr.sink.pop().await;
         let Some(seat) = state.seat.borrow().clone() else {
             continue;
         };
@@ -151,7 +206,14 @@ async fn route_events(state: Rc<State>, mgr: Rc<evdev::Manager>, session: Rc<Log
                 }
             }
             InputEvent::Motion { time_usec, dx, dy } => {
-                seat.pointer_motion(&state, time_usec, dx, dy, dx, dy);
+                let (speed, scale, _, adaptive) = device_factors(&state, &mgr, devnum);
+                let (udx, udy) = (dx * scale, dy * scale);
+                let dt_ms = last_motion
+                    .insert(devnum, time_usec)
+                    .map(|prev| (time_usec.saturating_sub(prev) as f64 / 1000.0).max(0.1))
+                    .unwrap_or(f64::INFINITY);
+                let accel = accel_factor(speed, adaptive, udx.hypot(udy) / dt_ms);
+                seat.pointer_motion(&state, time_usec, udx * accel, udy * accel, udx, udy);
                 if let Some(d) = state.display.borrow().as_ref() {
                     d.move_cursor(&state, seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
                 }
@@ -165,7 +227,11 @@ async fn route_events(state: Rc<State>, mgr: Rc<evdev::Manager>, session: Rc<Log
                 time_usec,
                 horizontal,
                 dist,
-            } => seat.pointer_axis(time_usec, horizontal, dist),
+            } => {
+                let (_, _, natural, _) = device_factors(&state, &mgr, devnum);
+                let dist = if natural { -dist } else { dist };
+                seat.pointer_axis(time_usec, horizontal, dist)
+            }
             InputEvent::Frame { .. } => seat.pointer_frame(),
         }
     }

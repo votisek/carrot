@@ -21,6 +21,7 @@ const EV_REL: u16 = 0x02;
 const EV_ABS: u16 = 0x03;
 
 const SYN_REPORT: u16 = 0;
+const SYN_DROPPED: u16 = 3;
 
 const REL_X: u16 = 0x00;
 const REL_Y: u16 = 0x01;
@@ -141,7 +142,56 @@ pub struct Device {
     pub active: Cell<bool>,
     /// edge dedup + release synthesis on pause/removal
     pub pressed: RefCell<HashSet<u32>>,
+    /// queue overruns announce once per device, not per drop
+    drop_warned: Cell<bool>,
+    /// from udev's MOUSE_DPI (hwdb), like libinput; 1000 when unlisted
+    pub dpi: f64,
     reader: Cell<Option<crate::engine::SpawnedFuture<()>>>,
+}
+
+/// hwdb MOUSE_DPI, resolved by udevd at device-add into /run/udev/data (the
+/// store libudev reads). no entry -> libinput's 1000dpi default.
+fn udev_mouse_dpi(devnum: u64) -> f64 {
+    let path = format!(
+        "/run/udev/data/c{}:{}",
+        rustix::fs::major(devnum),
+        rustix::fs::minor(devnum)
+    );
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return 1000.0;
+    };
+    for line in data.lines() {
+        let Some(value) = line.strip_prefix("E:MOUSE_DPI=") else {
+            continue;
+        };
+        return parse_mouse_dpi(value);
+    }
+    1000.0
+}
+
+/// "800@125", "1000", or a list "400@125 *800@125 1600@125" where the star
+/// marks the device default
+fn parse_mouse_dpi(value: &str) -> f64 {
+    let mut first = None;
+    for entry in value.split_whitespace() {
+        let (starred, entry) = match entry.strip_prefix('*') {
+            Some(e) => (true, e),
+            None => (false, entry),
+        };
+        let dpi: f64 = entry
+            .split('@')
+            .next()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(0.0);
+        if dpi <= 0.0 {
+            continue;
+        }
+        if starred {
+            return dpi;
+        }
+        first.get_or_insert(dpi);
+    }
+    first.unwrap_or(1000.0)
 }
 
 const EVENT_SIZE: usize = 24;
@@ -210,6 +260,8 @@ impl Manager {
             fd: RefCell::new(fd),
             active: Cell::new(!inactive),
             pressed: RefCell::new(HashSet::new()),
+            drop_warned: Cell::new(false),
+            dpi: udev_mouse_dpi(devnum),
             reader: Cell::new(None),
         });
         if dev.active.get() {
@@ -386,6 +438,20 @@ impl Device {
                             }
                             _ => {}
                         },
+                        // the kernel queue overran and events were lost; the
+                        // pending rel state is garbage, start the batch over
+                        EV_SYN if code == SYN_DROPPED => {
+                            if !dev.drop_warned.replace(true) {
+                                eprintln!(
+                                    "carrot: input: {} overran the kernel queue, events dropped",
+                                    dev.name
+                                );
+                            }
+                            dx = 0.0;
+                            dy = 0.0;
+                            wheel_v = 0;
+                            wheel_h = 0;
+                        }
                         EV_SYN if code == SYN_REPORT => {
                             let mut any = false;
                             if dx != 0.0 || dy != 0.0 {
@@ -441,6 +507,16 @@ mod tests {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
+    #[test]
+    fn mouse_dpi_parses_like_libinput() {
+        assert_eq!(parse_mouse_dpi("800@125"), 800.0);
+        assert_eq!(parse_mouse_dpi("1200"), 1200.0);
+        assert_eq!(parse_mouse_dpi("400@125 *800@1000 1600@125"), 800.0);
+        assert_eq!(parse_mouse_dpi("400@125 1600@125"), 400.0);
+        assert_eq!(parse_mouse_dpi("garbage"), 1000.0);
+        assert_eq!(parse_mouse_dpi(""), 1000.0);
+    }
+
     fn fake_device(devnum: u64) -> Rc<Device> {
         let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
         Rc::new(Device {
@@ -450,6 +526,8 @@ mod tests {
             fd: RefCell::new(Rc::new(fd)),
             active: Cell::new(true),
             pressed: RefCell::new([30u32].into_iter().collect()),
+            drop_warned: Cell::new(false),
+            dpi: 1000.0,
             reader: Cell::new(None),
         })
     }
