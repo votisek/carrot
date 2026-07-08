@@ -665,7 +665,6 @@ impl Conn {
                         return;
                     }
                     if let Some(d) = self.state.display.borrow().as_ref() {
-                        d.hide_cursor();
                     }
                     session.switch_vt(vt);
                 }
@@ -677,7 +676,7 @@ impl Conn {
 
     fn move_cursor(&self, seat: &Rc<SeatGlobal>) {
         if let Some(d) = self.state.display.borrow().as_ref() {
-            d.move_cursor(seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
+            d.move_cursor(&self.state, seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
         }
     }
 }

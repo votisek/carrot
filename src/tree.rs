@@ -117,7 +117,7 @@ fn warp_to_workspace(state: &Rc<State>, ws: &Workspace) {
         seat.warp(state, cx as f64, cy as f64);
     }
     if let Some(d) = state.display.borrow().as_ref() {
-        d.move_cursor(cx, cy);
+        d.move_cursor(state, cx, cy);
     }
 }
 

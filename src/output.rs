@@ -26,6 +26,13 @@ use std::rc::Rc;
 
 pub struct Display {
     pub outputs: RefCell<Vec<Rc<Output>>>,
+    /// current cursor image when compositing in software: pixels, w, h
+    sw_image: RefCell<Option<(Vec<u8>, u32, u32)>>,
+    sw_hot: Cell<(i32, i32)>,
+    sw_hidden: Cell<bool>,
+    sw: Cell<bool>,
+    /// bumps when sw_image changes; outputs rebuild their texture on it
+    sw_gen: Cell<u64>,
     dev: Rc<DrmDevice>,
     core: Rc<VkCore>,
     renderer: Rc<Renderer>,
@@ -79,17 +86,65 @@ impl Display {
         }
     }
 
-    /// hardware cursor moves bypass rendering
-    pub fn move_cursor(&self, x: i32, y: i32) {
+    /// composite the cursor instead of scanning the plane; the escape hatch
+    /// for planes that misbehave (joined-pipe modes smudge on xe)
+    pub fn set_software_cursor(&self, state: &Rc<State>, on: bool) {
+        if self.sw.replace(on) == on {
+            return;
+        }
+        if on {
+            // planes off; the frame carries the cursor from here
+            for out in self.outputs.borrow().iter() {
+                let pipe = out.conn.pipe.borrow();
+                if let Some(cur) = pipe.as_ref().and_then(|p| p.cursor.as_ref()) {
+                    cur.set_enabled(false);
+                }
+                drop(pipe);
+                out.conn.cursor_commit(&out.dev);
+            }
+            if self.sw_image.borrow().is_none() {
+                let seed = self
+                    .outputs
+                    .borrow()
+                    .first()
+                    .and_then(|o| o.theme_cursor.borrow().clone());
+                if let Some((px, w, h, hot)) = seed {
+                    *self.sw_image.borrow_mut() = Some((px, w, h));
+                    self.sw_hot.set(hot);
+                }
+            }
+            eprintln!("carrot: cursor: software compositing");
+        }
+        state.damage.trigger();
+    }
+
+    pub fn software_cursor(&self) -> bool {
+        self.sw.get()
+    }
+
+    /// hardware cursor moves bypass rendering. only the output under the
+    /// pointer shows its plane; the rest disable theirs. in software mode
+    /// the frame carries the cursor, so motion just redraws
+    pub fn move_cursor(&self, state: &Rc<State>, x: i32, y: i32) {
+        if self.sw.get() {
+            state.damage.trigger();
+            return;
+        }
         for out in self.outputs.borrow().iter() {
             if out.cursor_locked.get() {
                 continue;
             }
+            let inside = out.rect().contains(x, y) && !out.cursor_client_hidden.get();
             let (ox, oy) = out.pos.get();
-            let inside = out.rect().contains(x, y);
             let pipe = out.conn.pipe.borrow();
             let Some(p) = pipe.as_ref() else { continue };
-            let Some(cur) = &p.cursor else { continue };
+            let Some(cur) = &p.cursor else {
+                // joined output: the frame carries the cursor
+                if inside {
+                    state.damage.trigger();
+                }
+                continue;
+            };
             if inside {
                 let (hx, hy) = cur.hotspot.get();
                 cur.set_enabled(true);
@@ -97,6 +152,81 @@ impl Display {
             } else {
                 cur.set_enabled(false);
             }
+            drop(pipe);
+            out.conn.cursor_commit(&out.dev);
+        }
+    }
+
+    /// client-driven hide; vt teardown uses cursor_locked instead
+    pub fn set_cursor_hidden(&self, hidden: bool) {
+        self.sw_hidden.set(hidden);
+        if self.sw.get() {
+            return;
+        }
+        for out in self.outputs.borrow().iter() {
+            out.cursor_client_hidden.set(hidden);
+            let pipe = out.conn.pipe.borrow();
+            let Some(p) = pipe.as_ref() else { continue };
+            let Some(cur) = &p.cursor else { continue };
+            cur.set_enabled(!hidden && !out.cursor_locked.get());
+            drop(pipe);
+            out.conn.cursor_commit(&out.dev);
+        }
+    }
+
+    /// a client cursor surface's pixels onto every plane; the position
+    /// decides which plane is actually enabled
+    pub fn set_cursor_image(&self, px: &[u8], w: u32, h: u32, hot: (i32, i32)) {
+        *self.sw_image.borrow_mut() = Some((px.to_vec(), w, h));
+        self.sw_hot.set(hot);
+        self.sw_hidden.set(false);
+        self.sw_gen.set(self.sw_gen.get() + 1);
+        if self.sw.get() {
+            return;
+        }
+        for out in self.outputs.borrow().iter() {
+            out.cursor_client_hidden.set(false);
+            let pipe = out.conn.pipe.borrow();
+            let Some(p) = pipe.as_ref() else { continue };
+            let Some(cur) = &p.cursor else { continue };
+            cur.write(px, w, h);
+            cur.hotspot.set(hot);
+            drop(pipe);
+            out.conn.cursor_commit(&out.dev);
+        }
+    }
+
+    /// back to the seeded theme arrow
+    pub fn set_cursor_default(&self) {
+        {
+            let seed = self
+                .outputs
+                .borrow()
+                .first()
+                .and_then(|o| o.theme_cursor.borrow().clone());
+            if let Some((px, w, h, hot)) = seed {
+                *self.sw_image.borrow_mut() = Some((px, w, h));
+                self.sw_hot.set(hot);
+            }
+            self.sw_hidden.set(false);
+            self.sw_gen.set(self.sw_gen.get() + 1);
+        }
+        if self.sw.get() {
+            return;
+        }
+        for out in self.outputs.borrow().iter() {
+            let theme = out.theme_cursor.borrow();
+            let Some((px, w, h, hot)) = theme.as_ref() else {
+                continue;
+            };
+            let (px, w, h, hot) = (px.clone(), *w, *h, *hot);
+            drop(theme);
+            out.cursor_client_hidden.set(false);
+            let pipe = out.conn.pipe.borrow();
+            let Some(p) = pipe.as_ref() else { continue };
+            let Some(cur) = &p.cursor else { continue };
+            cur.write(&px, w, h);
+            cur.hotspot.set(hot);
             drop(pipe);
             out.conn.cursor_commit(&out.dev);
         }
@@ -171,11 +301,18 @@ pub struct Output {
     paused: Cell<bool>,
     /// queued motion must not re-arm the cursor while the vt is leaving
     cursor_locked: Cell<bool>,
+    /// the focused client asked for no cursor (set_cursor null)
+    cursor_client_hidden: Cell<bool>,
+    /// theme image + hotspot, restored whenever a client cursor goes away
+    theme_cursor: RefCell<Option<(Vec<u8>, u32, u32, (i32, i32))>>,
     /// implicit-sync fences of the dmabufs drawn this frame; the render
     /// submit waits them so client work lands before we sample
     frame_fences: RefCell<Vec<std::os::fd::OwnedFd>>,
     /// a vrr config on an incapable panel complains once, not per frame
     vrr_warned: Cell<bool>,
+    /// software-cursor texture; rebuilt when the image generation moves
+    cursor_tex: RefCell<Option<Texture>>,
+    cursor_gen: Cell<u64>,
 }
 
 impl Output {
@@ -243,6 +380,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                     out.usable.set(out.rect());
                     out.ws.set(outputs.len().min(8));
                     x += out.width as i32;
+                    seed_cursor(&out);
                     let refresh = out
                         .conn
                         .pipe
@@ -363,6 +501,11 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                             }
                         }
                         DeviceEvent::Resume { .. } => {
+                            let sw = st
+                                .display
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|d| d.software_cursor());
                             let mut heads = Vec::new();
                             for o in &outs {
                                 o.paused.set(false);
@@ -372,7 +515,8 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                                 o.conn.flip_pending.set(false);
                                 if let Some(p) = o.conn.pipe.borrow().as_ref() {
                                     if let Some(cur) = &p.cursor {
-                                        cur.set_enabled(true);
+                                        // software mode keeps planes benched
+                                        cur.set_enabled(!sw && !o.cursor_client_hidden.get());
                                     }
                                 }
                                 heads.push((o.conn.clone(), o.bufs[o.front.get()].fb));
@@ -455,6 +599,11 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
         state.output_size.set((uw as u32, uh as u32));
         let display = Display {
             outputs: RefCell::new(outputs),
+            sw_image: RefCell::new(None),
+            sw_hot: Cell::new((0, 0)),
+            sw_hidden: Cell::new(false),
+            sw: Cell::new(false),
+            sw_gen: Cell::new(1),
             dev,
             core,
             renderer,
@@ -466,6 +615,20 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
         };
         for out in display.outputs.borrow().iter() {
             register_output_global(state, &display, out);
+        }
+        {
+            let seed = display
+                .outputs
+                .borrow()
+                .first()
+                .and_then(|o| o.theme_cursor.borrow().clone());
+            if let Some((px, w, h, hot)) = seed {
+                *display.sw_image.borrow_mut() = Some((px, w, h));
+                display.sw_hot.set(hot);
+            }
+        }
+        if state.config.borrow().software_cursor {
+            display.set_software_cursor(state, true);
         }
         // paint over the modesets' uninitialized first buffers
         state.damage.trigger();
@@ -565,6 +728,96 @@ pub fn output_geometry(state: &Rc<State>, name: &str) -> Option<(usize, u32, u32
     outs.iter()
         .find(|o| o.conn.name == name)
         .map(|o| (o.index.get(), o.width, o.height))
+}
+
+/// the composited cursor: topmost, on the output under the pointer only
+fn draw_sw_cursor(state: &Rc<State>, out: &Rc<Output>, ops: &mut Vec<RenderOp>) {
+    let d = state.display.borrow();
+    let Some(d) = d.as_ref() else { return };
+    // joined-pipe outputs have no plane at all; they composite regardless
+    // of the global software-cursor setting
+    let plane_less = out
+        .conn
+        .pipe
+        .borrow()
+        .as_ref()
+        .is_none_or(|p| p.cursor.is_none());
+    if !(d.sw.get() || plane_less) || d.sw_hidden.get() || out.cursor_locked.get() {
+        return;
+    }
+    let Some(seat) = state.seat.borrow().clone() else { return };
+    let (px, py) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
+    if !out.rect().contains(px, py) {
+        return;
+    }
+    let image = d.sw_image.borrow();
+    let Some((pixels, w, h)) = image.as_ref() else { return };
+    let (w, h) = (*w, *h);
+    // texture follows the image generation
+    if out.cursor_gen.get() != d.sw_gen.get() || out.cursor_tex.borrow().is_none() {
+        let tex = match out.renderer.create_texture(w, h, false) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("carrot: cursor texture failed: {e}");
+                return;
+            }
+        };
+        let row = (w * 4) as usize;
+        let res = out.renderer.upload_texture(&tex, |dst| {
+            dst[..row * h as usize].copy_from_slice(&pixels[..row * h as usize]);
+        });
+        if let Err(e) = res {
+            eprintln!("carrot: cursor upload failed: {e}");
+            return;
+        }
+        if let Some(old) = out.cursor_tex.borrow_mut().replace(tex) {
+            out.renderer.destroy_texture(&old);
+        }
+        out.cursor_gen.set(d.sw_gen.get());
+    }
+    drop(image);
+    let (hx, hy) = d.sw_hot.get();
+    let (gx, gy) = out.pos.get();
+    let x = px - hx - gx;
+    let y = py - hy - gy;
+    let tex = out.cursor_tex.borrow();
+    let Some(tex) = tex.as_ref() else { return };
+    let fx = |v: i32| v as f32 / out.width as f32 * 2.0 - 1.0;
+    let fy = |v: i32| v as f32 / out.height as f32 * 2.0 - 1.0;
+    ops.push(RenderOp::Tex {
+        view: tex.view,
+        pos: [fx(x), fy(y)],
+        size: [
+            w as f32 / out.width as f32 * 2.0,
+            h as f32 / out.height as f32 * 2.0,
+        ],
+        uv_pos: [0.0, 0.0],
+        uv_size: [1.0, 1.0],
+        mul: 1.0,
+        opaque: false,
+    });
+}
+
+/// seed the cursor plane: system theme, else built-in arrow
+fn seed_cursor(out: &Rc<Output>) {
+    if let Some(p) = out.conn.pipe.borrow().as_ref() {
+        if let Some(cur) = &p.cursor {
+            match crate::input::cursor_theme::load("left_ptr") {
+                Some(img) => {
+                    cur.write(&img.pixels, img.width, img.height);
+                    cur.hotspot.set(img.hotspot);
+                    *out.theme_cursor.borrow_mut() =
+                        Some((img.pixels, img.width, img.height, img.hotspot));
+                }
+                None => {
+                    eprintln!("carrot: no xcursor theme found, using the built-in arrow");
+                    let (px, w, h) = default_cursor();
+                    cur.write(&px, w, h);
+                    *out.theme_cursor.borrow_mut() = Some((px, w, h, (0, 0)));
+                }
+            }
+        }
+    }
 }
 
 async fn init_card(
@@ -759,6 +1012,7 @@ fn rescan(state: &Rc<State>) {
         match init_output(&d.dev, &d.core, &d.renderer, conn, d.devnum) {
             Ok(out) => {
                 let out = Rc::new(out);
+                seed_cursor(&out);
                 register_output_global(state, d, &out);
                 let st = state.clone();
                 let o = out.clone();
@@ -869,6 +1123,9 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
         let (cx, cy) = clamp_pointer(state, px, py);
         if (cx, cy) != (px, py) {
             seat.warp(state, cx, cy);
+            if let Some(d) = state.display.borrow().as_ref() {
+                d.move_cursor(state, cx as i32, cy as i32);
+            }
         }
     }
     // surviving outputs may have new positions; bound objects re-learn them
@@ -1015,8 +1272,12 @@ fn init_output(
         devnum,
         paused: Cell::new(false),
         cursor_locked: Cell::new(false),
+        cursor_client_hidden: Cell::new(false),
+        theme_cursor: RefCell::new(None),
         frame_fences: RefCell::new(Vec::new()),
         vrr_warned: Cell::new(false),
+        cursor_tex: RefCell::new(None),
+        cursor_gen: Cell::new(0),
     })
 }
 
@@ -1309,6 +1570,7 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
             }
         }
     }
+    draw_sw_cursor(state, out, &mut ops);
 
     // textures for gone buffers don't outlive the frame
     let mut textures = out.textures.borrow_mut();

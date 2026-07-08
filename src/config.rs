@@ -213,6 +213,7 @@ pub struct Config {
     pub allow_tearing: bool,
     /// composite the cursor instead of using the hardware plane; the
     /// escape hatch for planes that misbehave (joined-pipe modes)
+    pub software_cursor: bool,
     pub input: InputCfg,
     pub devices: Vec<DeviceRule>,
     pub decoration: DecorationCfg,
@@ -250,6 +251,7 @@ impl Default for Config {
             float_above_fullscreen: false,
             layout: "dwindle".to_string(),
             allow_tearing: false,
+            software_cursor: false,
             input: InputCfg::default(),
             devices: Vec::new(),
             decoration: DecorationCfg::default(),

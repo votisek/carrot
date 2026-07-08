@@ -218,7 +218,14 @@ fn spawn(state: &Rc<State>, cmd: &str) {
 
 pub fn reload(state: &Rc<State>) -> Result<(), String> {
     let cfg = crate::config::load()?;
+    let sw = cfg.software_cursor;
     *state.config.borrow_mut() = Rc::new(cfg);
+    if let Some(seat) = state.seat.borrow().clone() {
+        seat.apply_input_config(state);
+    }
+    if let Some(d) = state.display.borrow().as_ref() {
+        d.set_software_cursor(state, sw);
+    }
     let ws = crate::tree::active(state);
     crate::tree::relayout(state, &ws);
     crate::shell::layer::arrange(state);

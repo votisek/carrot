@@ -258,8 +258,17 @@ impl Connector {
         let primary = take_plane(PlaneType::Primary, XRGB8888.drm)
             .ok_or(DrmError::NoPrimaryPlane(self.id))?;
         primary.crtc.set(crtc.id);
-        // cursor is best-effort; an output without one still works
-        let cursor = take_plane(PlaneType::Cursor, ARGB8888.drm).and_then(|p| {
+        // joined modes: the kernel gangs two pipes and manages their cursor
+        // planes itself - any cursor prop we stage arms phantom doubled
+        // cursor state (the 1px smudge). composite the cursor instead.
+        let cursor = if mode_needs_joiner(&mode) {
+            eprintln!(
+                "carrot: {}: joined mode, hardware cursor off (composited instead)",
+                self.name
+            );
+            None
+        } else {
+            take_plane(PlaneType::Cursor, ARGB8888.drm).and_then(|p| {
             p.crtc.set(crtc.id);
             match CursorPlane::new(dev, p.clone()) {
                 Ok(c) => Some(c),
@@ -269,7 +278,8 @@ impl Connector {
                     None
                 }
             }
-        });
+            })
+        };
 
         if prefer.is_some() {
             eprintln!(

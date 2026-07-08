@@ -825,7 +825,7 @@ impl SeatGlobal {
                 self.ptr_x.set(x);
                 self.ptr_y.set(y);
                 if let Some(d) = state.display.borrow().as_ref() {
-                    d.move_cursor(x as i32, y as i32);
+                    d.move_cursor(state, x as i32, y as i32);
                 }
             }
         }
