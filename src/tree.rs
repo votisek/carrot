@@ -37,6 +37,10 @@ pub struct Window {
     pub node: RefCell<Weak<dwindle::Node>>,
     pub floating: Cell<bool>,
     pub fullscreen: Cell<bool>,
+    /// a rule ORed tearing on for this window
+    pub rule_immediate: Cell<bool>,
+    /// a rule set per-window opacity; None means fully opaque
+    pub rule_opacity: Cell<Option<f32>>,
 }
 
 impl Window {
@@ -48,6 +52,8 @@ impl Window {
             node: RefCell::new(Weak::new()),
             floating: Cell::new(false),
             fullscreen: Cell::new(false),
+            rule_immediate: Cell::new(false),
+            rule_opacity: Cell::new(None),
         }
     }
 
@@ -305,7 +311,23 @@ pub fn window_for_surface(state: &Rc<State>, s: &Rc<WlSurface>) -> Option<Rc<Win
 // -- map / unmap --
 
 pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
-    let ws = active(state);
+    let cfg = state.config.borrow().clone();
+    let fx = crate::config::rule_effects(
+        &cfg,
+        &win.app_id(),
+        &win.title(),
+        win.x11_opt().is_some(),
+        win.wants_fullscreen(),
+    );
+    win.rule_immediate.set(fx.immediate);
+    win.rule_opacity
+        .set(fx.opacity.map(|o| o.clamp(0.0, 1.0) as f32));
+    // a rule can pin the window to a workspace (already 0-based) without switching to it
+    let ws = fx
+        .workspace
+        .and_then(|n| state.workspaces.borrow().get(n).cloned())
+        .unwrap_or_else(|| active(state));
+    let visible = Rc::ptr_eq(&ws, &active(state));
     // untile any fullscreen first; splitting behind it helps nobody
     let fs = ws.fullscreen.borrow().clone();
     if let Some(fs) = fs {
@@ -315,10 +337,16 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     let (cx, cy) = cursor_pos(state);
     ws.tiling.insert(win, cx, cy);
     relayout(state, &ws);
-    if win.wants_fullscreen() {
+    if fx.floating == Some(true) && !win.floating.get() {
+        float_into(state, &ws, win, fx.size, fx.center);
+    }
+    if win.wants_fullscreen() && fx.floating != Some(true) {
         set_fullscreen(state, win, true);
     }
-    focus_window(state, Some(win));
+    // a rule-targeted background workspace never steals focus
+    if visible {
+        focus_window(state, Some(win));
+    }
     crate::ipc::emit(
         state,
         &serde_json::json!({ "window-opened": {
@@ -328,6 +356,30 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     );
     crate::protocol::foreign_toplevel::window_mapped(state, win);
     state.damage.trigger();
+}
+
+// rule-driven float placement: out of the tiling, sized and positioned
+fn float_into(
+    state: &Rc<State>,
+    ws: &Rc<Workspace>,
+    win: &Rc<Window>,
+    size: Option<(i32, i32)>,
+    center: bool,
+) {
+    ws.tiling.remove(win);
+    win.floating.set(true);
+    let (sw, sh) = output_extent(state);
+    let (w, h) = size.unwrap_or((sw / 2, sh / 2));
+    let (w, h) = (w.max(1), h.max(1));
+    let (x, y) = if center || size.is_none() {
+        ((sw - w) / 2, (sh - h) / 2)
+    } else {
+        (sw / 4, sh / 4)
+    };
+    win.rect.set(Rect::new_sized_saturating(x, y, w, h));
+    ws.floats.borrow_mut().push(win.clone());
+    win.configure_rect();
+    relayout(state, ws);
 }
 
 pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {

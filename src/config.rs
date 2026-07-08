@@ -126,6 +126,67 @@ pub struct WindowRule {
     pub redirect_keys: Vec<String>,
 }
 
+/// in file order, later scalar wins, flags accumulate
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuleFx {
+    pub floating: Option<bool>,
+    pub workspace: Option<usize>,
+    pub immediate: bool,
+    pub opacity: Option<f64>,
+    pub size: Option<(i32, i32)>,
+    pub center: bool,
+}
+
+pub fn rule_effects(
+    cfg: &Config,
+    class: &str,
+    title: &str,
+    xwayland: bool,
+    fullscreen: bool,
+) -> RuleFx {
+    let mut fx = RuleFx::default();
+    let matches_re = |pat: &Option<String>, hay: &str| -> bool {
+        match pat {
+            None => true,
+            // validated at parse time; a stale failure just never matches
+            Some(p) => regex_lite::Regex::new(p).is_ok_and(|re| re.is_match(hay)),
+        }
+    };
+    for r in cfg.rules.iter() {
+        if !matches_re(&r.match_class, class) || !matches_re(&r.match_title, title) {
+            continue;
+        }
+        if let Some(want) = r.match_xwayland {
+            if want != xwayland {
+                continue;
+            }
+        }
+        if let Some(want) = r.match_fullscreen {
+            if want != fullscreen {
+                continue;
+            }
+        }
+        if r.floating {
+            fx.floating = Some(true);
+        }
+        if r.tile {
+            fx.floating = Some(false);
+        }
+        if let Some(ws) = r.workspace {
+            fx.workspace = Some(ws);
+        }
+        fx.immediate |= r.immediate;
+        if let Some(o) = r.opacity {
+            fx.opacity = Some(o);
+        }
+        if let Some(sz) = r.size {
+            fx.size = Some(sz);
+        }
+        fx.center |= r.center;
+    }
+    fx
+}
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct LayerRule {
     pub match_namespace: Option<String>,

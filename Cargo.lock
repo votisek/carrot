@@ -55,6 +55,7 @@ dependencies = [
  "ash",
  "kbvm",
  "kdl",
+ "regex-lite",
  "rustix",
  "serde",
  "serde_json",
@@ -319,6 +320,12 @@ checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "rustix"

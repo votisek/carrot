@@ -563,9 +563,10 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
             push_borders(out, rect, cfg.border, color, ops);
         }
         let geo = win.geometry();
-        draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, ops, live);
+        let alpha = win.rule_opacity.get().unwrap_or(1.0);
+        draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, ops, live);
         if let Some(tl) = win.xdg_opt() {
-            draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
+            draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, alpha, ops, live);
         }
     };
 
@@ -612,6 +613,7 @@ fn draw_surface_tree(
     x: i32,
     y: i32,
     clip: Rect,
+    alpha: f32,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, u64)>,
 ) {
@@ -631,16 +633,16 @@ fn draw_surface_tree(
         drop(children);
         for sub in &stack[..below] {
             let (px, py) = sub.position.get();
-            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, ops, live);
+            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, ops, live);
         }
-        draw_buffer(out, surface, x, y, clip, ops, live);
+        draw_buffer(out, surface, x, y, clip, alpha, ops, live);
         for sub in &stack[below..] {
             let (px, py) = sub.position.get();
-            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, ops, live);
+            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, ops, live);
         }
     } else {
         drop(children);
-        draw_buffer(out, surface, x, y, clip, ops, live);
+        draw_buffer(out, surface, x, y, clip, alpha, ops, live);
     }
 }
 
@@ -651,6 +653,7 @@ fn draw_popup(
     ox: i32,
     oy: i32,
     screen: Rect,
+    alpha: f32,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, u64)>,
 ) {
@@ -660,8 +663,8 @@ fn draw_popup(
     let (rx, ry) = p.rel.get();
     let (px, py) = (ox + rx, oy + ry);
     let geo = p.xdg.geometry();
-    draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, ops, live);
-    draw_popups(state, out, &p.xdg, px, py, screen, ops, live);
+    draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, alpha, ops, live);
+    draw_popups(state, out, &p.xdg, px, py, screen, alpha, ops, live);
 }
 
 fn draw_popups(
@@ -671,10 +674,11 @@ fn draw_popups(
     ox: i32,
     oy: i32,
     screen: Rect,
+    alpha: f32,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, u64)>,
 ) {
-    xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, ops, live));
+    xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, alpha, ops, live));
 }
 
 // one shell layer, mapping order = z within it, popups on top of each
@@ -692,8 +696,8 @@ fn draw_layer(
             continue;
         }
         let r = ls.rect.get();
-        draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, ops, live);
-        ls.for_each_popup(|p| draw_popup(state, out, p, r.x1, r.y1, screen, ops, live));
+        draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, ops, live);
+        ls.for_each_popup(|p| draw_popup(state, out, p, r.x1, r.y1, screen, 1.0, ops, live));
     }
 }
 
@@ -705,6 +709,7 @@ fn draw_buffer(
     x: i32,
     y: i32,
     clip: Rect,
+    alpha: f32,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, u64)>,
 ) {
@@ -858,8 +863,8 @@ fn draw_buffer(
             vis.width() as f32 / sw as f32,
             vis.height() as f32 / sh as f32,
         ],
-        mul: 1.0,
-        opaque,
+        mul: alpha,
+        opaque: opaque && alpha >= 1.0,
     });
 }
 
@@ -921,7 +926,7 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
     let geo = win.geometry();
     let mut ops = Vec::new();
     let mut live = Vec::new();
-    draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, &mut ops, &mut live);
+    draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, &mut ops, &mut live);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
