@@ -52,6 +52,8 @@ pub struct State {
     pub icc_sessions: RefCell<Vec<Rc<crate::protocol::image_copy_capture::IccSession>>>,
     /// idle notifications + inhibitors; the pump task ticks deadlines
     pub idle: crate::protocol::idle::IdleState,
+    /// heads are dark (dpms); any input wakes them
+    pub dpms_off: std::cell::Cell<bool>,
     /// replaced dmabuf attachments; released after the next present's fence
     pub retired: RefCell<Vec<crate::protocol::shm::AttachedBuffer>>,
     /// frames between render submit and fence; gates the retired drain
@@ -94,6 +96,7 @@ impl State {
             ext_toplevel_lists: RefCell::new(Vec::new()),
             icc_sessions: RefCell::new(Vec::new()),
             idle: Default::default(),
+            dpms_off: std::cell::Cell::new(false),
             retired: RefCell::new(Vec::new()),
             frames_in_flight: std::cell::Cell::new(0),
             dmabuf_info: RefCell::new(None),

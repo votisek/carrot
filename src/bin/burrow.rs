@@ -5,8 +5,9 @@
 //   burrow toggle-fullscreen    burrow reload
 //   burrow close-window         burrow subscribe
 //
-// one request per line in, one json reply per line out; subscribe streams
-// events until killed.
+// one request per line in, one json reply per line out. replies render as
+// expanded key: value blocks; --json keeps the wire form, and subscribe
+// always streams raw ndjson for scripts.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -33,18 +34,11 @@ fn socket_path() -> Option<std::path::PathBuf> {
 }
 
 fn usage() -> ! {
-    eprintln!(
-        "usage: burrow <command>\n\
-         actions:  workspace N | send-to-workspace N | toggle-fullscreen |\n\
-                   toggle-floating | close-window | focus-next | focus-prev | spawn CMD.. | quit\n\
-         queries:  workspaces | windows\n\
-         control:  reload | subscribe"
-    );
     std::process::exit(2)
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         usage();
     }
@@ -54,16 +48,37 @@ fn main() {
         n.saturating_sub(1)
     };
     let request = match args[0].as_str() {
+        // a signed argument means a relative jump
+        "workspace" if args.get(1).is_some_and(|a| a.starts_with(['+', '-'])) => {
+            let d: i64 = args[1].parse().unwrap_or_else(|_| usage());
+            format!("{{\"workspace-rel\":{d}}}")
+        }
         "workspace" => format!("{{\"workspace\":{}}}", n_arg(1)),
+        "workspace-rel" => {
+            let d: i64 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or_else(|| usage());
+            format!("{{\"workspace-rel\":{d}}}")
+        }
         "send-to-workspace" => format!("{{\"send-to-workspace\":{}}}", n_arg(1)),
+        "move-to-workspace" => format!("{{\"move-to-workspace\":{}}}", n_arg(1)),
         "spawn" => {
             if args.len() < 2 {
                 usage();
             }
             serde_json::json!({ "spawn": args[1..].join(" ") }).to_string()
         }
+        "split-ratio" => {
+            let d: f64 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or_else(|| usage());
+            serde_json::json!({ "split-ratio": d }).to_string()
+        }
+        cmd @ ("focus-left" | "focus-right" | "focus-up" | "focus-down") => {
+            format!("{{\"focus-dir\":\"{}\"}}", &cmd["focus-".len()..])
+        }
+        cmd @ ("swap-left" | "swap-right" | "swap-up" | "swap-down") => {
+            format!("{{\"swap-dir\":\"{}\"}}", &cmd["swap-".len()..])
+        }
         cmd @ ("toggle-fullscreen" | "toggle-floating" | "close-window" | "focus-next"
-        | "focus-prev" | "quit" | "workspaces" | "windows" | "reload" | "subscribe") => {
+        | "focus-prev" | "quit" | "monitors" | "workspaces" | "windows" | "clients" | "reload"
+        | "subscribe" | "dump-shadow" | "dpms-on" | "dpms-off") => {
             serde_json::json!(cmd).to_string()
         }
         _ => usage(),
@@ -84,10 +99,8 @@ fn main() {
     let reader = BufReader::new(stream);
     let streaming = args[0] == "subscribe";
     for line in reader.lines() {
-        match line {
-            Ok(l) => println!("{l}"),
-            Err(_) => break,
-        }
+        let Ok(l) = line else { break };
+            println!("{l}");
         if !streaming {
             break;
         }

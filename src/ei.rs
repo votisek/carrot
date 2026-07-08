@@ -665,6 +665,7 @@ impl Conn {
                         return;
                     }
                     if let Some(d) = self.state.display.borrow().as_ref() {
+                        d.prepare_vt_switch(&self.state, vt);
                     }
                     session.switch_vt(vt);
                 }

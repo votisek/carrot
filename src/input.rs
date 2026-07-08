@@ -140,7 +140,7 @@ async fn route_events(state: Rc<State>, mgr: Rc<evdev::Manager>, session: Rc<Log
                         }
                         // clear cursor plane while we still hold drm master
                         if let Some(d) = state.display.borrow().as_ref() {
-                            d.hide_cursor();
+                            d.prepare_vt_switch(&state, vt);
                         }
                         session.switch_vt(vt);
                     }

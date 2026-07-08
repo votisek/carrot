@@ -78,11 +78,35 @@ impl Display {
 impl Display {
     /// pre-SwitchTo teardown: the only moment we know a switch is coming and
     /// still hold master. logind drops master before signaling PauseDevice,
-    /// so the pause path is too late.
-    pub fn hide_cursor(&self) {
+    /// so the pause path is too late. switch_vt is fire-and-forget, so a
+    /// rejected switch would strand the cursor locked - the timer re-arms it
+    /// if no pause ever arrives.
+    pub fn prepare_vt_switch(&self, state: &Rc<State>, vt: u32) {
         for out in self.outputs.borrow().iter() {
             out.cursor_locked.set(true);
             out.conn.cursor_hide(&out.dev);
+            let o = out.clone();
+            let st = state.clone();
+            *out.rearm.borrow_mut() = Some(state.eng.spawn("vt rearm", async move {
+                let _ = st.wheel.timeout(500).await;
+                if o.paused.get() || !o.cursor_locked.get() {
+                    return;
+                }
+                eprintln!("carrot: vt {vt} switch never paused us, rearming the cursor");
+                o.cursor_locked.set(false);
+                let sw = st
+                    .display
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|d| d.software_cursor());
+                if let Some(p) = o.conn.pipe.borrow().as_ref() {
+                    if let Some(cur) = &p.cursor {
+                        cur.set_enabled(!sw && !o.cursor_client_hidden.get());
+                    }
+                }
+                o.conn.cursor_commit(&o.dev);
+                st.damage.trigger();
+            }));
         }
     }
 
@@ -305,6 +329,9 @@ pub struct Output {
     cursor_client_hidden: Cell<bool>,
     /// theme image + hotspot, restored whenever a client cursor goes away
     theme_cursor: RefCell<Option<(Vec<u8>, u32, u32, (i32, i32))>>,
+    /// pending unlock for a switch that never pauses us; replacing it (next
+    /// switch, or any pause/resume) cancels the stale timer
+    rearm: RefCell<Option<SpawnedFuture<()>>>,
     /// implicit-sync fences of the dmabufs drawn this frame; the render
     /// submit waits them so client work lands before we sample
     frame_fences: RefCell<Vec<std::os::fd::OwnedFd>>,
@@ -498,6 +525,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                         DeviceEvent::Pause { .. } => {
                             for o in &outs {
                                 o.paused.set(true);
+                                o.rearm.take();
                             }
                         }
                         DeviceEvent::Resume { .. } => {
@@ -510,6 +538,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                             for o in &outs {
                                 o.paused.set(false);
                                 o.cursor_locked.set(false);
+                                o.rearm.take();
                                 // an in-flight flip never completes when the
                                 // vt left; unwedge the gate
                                 o.conn.flip_pending.set(false);
@@ -1274,6 +1303,7 @@ fn init_output(
         cursor_locked: Cell::new(false),
         cursor_client_hidden: Cell::new(false),
         theme_cursor: RefCell::new(None),
+        rearm: RefCell::new(None),
         frame_fences: RefCell::new(Vec::new()),
         vrr_warned: Cell::new(false),
         cursor_tex: RefCell::new(None),
@@ -1408,6 +1438,45 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         // captures complete against the frame just shown
         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
     }
+}
+
+/// screens dark or awake without touching the session. off folds every
+/// head's disable into one commit; on replays the resume modeset
+pub fn dpms(state: &Rc<State>, on: bool) {
+    if state.dpms_off.get() != on {
+        return;
+    }
+    let outs: Vec<Rc<Output>> = match state.display.borrow().as_ref() {
+        Some(d) => d.outputs.borrow().clone(),
+        None => return,
+    };
+    if !on {
+        state.dpms_off.set(true);
+        for o in &outs {
+            o.paused.set(true);
+        }
+        if let Some(o) = outs.first() {
+            if let Err(e) = o.dev.modeset_heads(&[]) {
+                eprintln!("carrot: dpms off: {e}");
+            }
+        }
+        eprintln!("carrot: dpms: screens off");
+        return;
+    }
+    state.dpms_off.set(false);
+    let mut heads = Vec::new();
+    for o in &outs {
+        o.paused.set(false);
+        o.conn.flip_pending.set(false);
+        heads.push((o.conn.clone(), o.bufs[o.front.get()].fb));
+    }
+    if let Some(o) = outs.first() {
+        if let Err(e) = o.dev.modeset_heads(&heads) {
+            eprintln!("carrot: dpms on: {e}");
+        }
+    }
+    eprintln!("carrot: dpms: screens on");
+    state.damage.trigger();
 }
 
 /// clamp a global pointer position: x into the union of outputs, y into

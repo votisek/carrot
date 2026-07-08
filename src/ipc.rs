@@ -131,8 +131,7 @@ async fn write_all(state: &Rc<State>, fd: &Rc<OwnedFd>, mut buf: Vec<u8>) -> Res
     Ok(())
 }
 
-// one dispatch path for the whole vocabulary; keybinds call the same
-// dispatch_action the socket does
+// keybinds share this same dispatch_action; queries are plain string commands
 fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
     if let Ok(action) = serde_json::from_str::<Action>(line) {
         dispatch_action(state, &action);
@@ -142,6 +141,14 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
         Ok("workspaces") => Ok(workspaces_json(state)),
         Ok("windows") => Ok(windows_json(state)),
         Ok("reload") => reload(state).map(|_| json!(true)),
+        Ok("dpms-off") => {
+            crate::output::dpms(state, false);
+            Ok(json!(true))
+        }
+        Ok("dpms-on") => {
+            crate::output::dpms(state, true);
+            Ok(json!(true))
+        }
         Ok(other) => Err(format!("unknown command \"{other}\"")),
         Err(_) => Err(format!("cannot parse \"{line}\"")),
     }

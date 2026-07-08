@@ -60,6 +60,9 @@ pub fn note_activity(state: &Rc<State>) {
             }
         }
     }
+    if state.dpms_off.get() {
+        crate::output::dpms(state, true);
+    }
 }
 
 /// deadline sweep
