@@ -172,72 +172,125 @@ impl Manager {
         };
         nodes.sort();
         for node in nodes {
-            let Ok(st) = rustix::fs::stat(&node) else {
-                continue;
-            };
-            let devnum = st.st_rdev;
-            let (fd, inactive) = match session.take_device(devnum).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("carrot: {}: TakeDevice: {e}", node.display());
-                    continue;
-                }
-            };
-            let Some(kind) = classify(fd.as_fd()) else {
-                session.release_device(devnum);
-                continue;
-            };
-            let dev = Rc::new(Device {
-                devnum,
-                name: name(fd.as_fd()),
-                kind,
-                fd: RefCell::new(fd),
-                active: Cell::new(!inactive),
-                pressed: RefCell::new(HashSet::new()),
-                reader: Cell::new(None),
-            });
-            if dev.active.get() {
-                dev.spawn_reader(state, &mgr.sink);
-            }
-            let d = dev.clone();
-            let st2 = state.clone();
-            let sink = mgr.sink.clone();
-            session.on_device(
-                devnum,
-                Rc::new(move |ev| match ev {
-                    DeviceEvent::Pause { .. } | DeviceEvent::Gone { .. } => {
-                        d.active.set(false);
-                        d.reader.take();
-                        // clients must not see keys stuck across the vt
-                        let held: Vec<u32> = d.pressed.borrow_mut().drain().collect();
-                        for key in held {
-                            sink.push((
-                                d.devnum,
-                                InputEvent::Key {
-                                    time_usec: 0,
-                                    key,
-                                    pressed: false,
-                                },
-                            ));
-                        }
-                        if !matches!(ev, DeviceEvent::Gone { .. }) {
-                            return;
-                        }
-                    }
-                    DeviceEvent::Resume { fd, .. } => {
-                        *d.fd.borrow_mut() = fd;
-                        d.active.set(true);
-                        // keys pressed while away: kernel bitmask is truth, seed so releases route
-                        let held = held_keys(d.fd.borrow().as_fd());
-                        *d.pressed.borrow_mut() = held.into_iter().collect();
-                        d.spawn_reader(&st2, &sink);
-                    }
-                }),
-            );
-            crate::trace!("input device {}: {} ({:?})", dev.devnum, dev.name, dev.kind);
-            mgr.devices.borrow_mut().push(dev);
+            mgr.add_device(state, session, &node).await;
         }
         mgr
+    }
+
+    /// bring one node under management; devnums already present are skipped
+    pub async fn add_device(
+        self: &Rc<Self>,
+        state: &Rc<State>,
+        session: &Rc<LogindSession>,
+        node: &std::path::Path,
+    ) -> Option<Rc<Device>> {
+        let devnum = rustix::fs::stat(node).ok()?.st_rdev;
+        if self.devices.borrow().iter().any(|d| d.devnum == devnum) {
+            return None;
+        }
+        let (fd, inactive) = match session.take_device(devnum).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("carrot: {}: TakeDevice: {e}", node.display());
+                return None;
+            }
+        };
+        // a duplicate uevent may have raced us across the await
+        if self.devices.borrow().iter().any(|d| d.devnum == devnum) {
+            return None;
+        }
+        let Some(kind) = classify(fd.as_fd()) else {
+            session.release_device(devnum);
+            return None;
+        };
+        let dev = Rc::new(Device {
+            devnum,
+            name: name(fd.as_fd()),
+            kind,
+            fd: RefCell::new(fd),
+            active: Cell::new(!inactive),
+            pressed: RefCell::new(HashSet::new()),
+            reader: Cell::new(None),
+        });
+        if dev.active.get() {
+            dev.spawn_reader(state, &self.sink);
+        }
+        let d = dev.clone();
+        let st2 = state.clone();
+        let sink = self.sink.clone();
+        let mgr = Rc::downgrade(self);
+        let sess = Rc::downgrade(session);
+        session.on_device(
+            devnum,
+            Rc::new(move |ev| match ev {
+                DeviceEvent::Pause { .. } => {
+                    d.active.set(false);
+                    d.reader.take();
+                    // clients must not see keys stuck across the vt
+                    let held: Vec<u32> = d.pressed.borrow_mut().drain().collect();
+                    for key in held {
+                        sink.push((
+                            d.devnum,
+                            InputEvent::Key {
+                                time_usec: 0,
+                                key,
+                                pressed: false,
+                            },
+                        ));
+                    }
+                }
+                DeviceEvent::Gone { .. } => {
+                    if let (Some(m), Some(s)) = (mgr.upgrade(), sess.upgrade()) {
+                        m.remove_device(&s, d.devnum);
+                    }
+                }
+                DeviceEvent::Resume { fd, .. } => {
+                    *d.fd.borrow_mut() = fd;
+                    d.active.set(true);
+                    // keys pressed while away: kernel bitmask is truth, seed so releases route
+                    let held = held_keys(d.fd.borrow().as_fd());
+                    *d.pressed.borrow_mut() = held.into_iter().collect();
+                    d.spawn_reader(&st2, &sink);
+                }
+            }),
+        );
+        crate::trace!("input device {}: {} ({:?})", dev.devnum, dev.name, dev.kind);
+        self.devices.borrow_mut().push(dev.clone());
+        Some(dev)
+    }
+
+    /// unlist the device, stop its reader, and release held keys
+    fn detach_device(&self, devnum: u64) -> Option<Rc<Device>> {
+        let dev = {
+            let mut devs = self.devices.borrow_mut();
+            let pos = devs.iter().position(|d| d.devnum == devnum)?;
+            devs.remove(pos)
+        };
+        dev.active.set(false);
+        dev.reader.take();
+        // removal can beat the pause that would have synthesized these
+        let held: Vec<u32> = dev.pressed.borrow_mut().drain().collect();
+        for key in held {
+            self.sink.push((
+                devnum,
+                InputEvent::Key {
+                    time_usec: 0,
+                    key,
+                    pressed: false,
+                },
+            ));
+        }
+        Some(dev)
+    }
+
+    /// full teardown: reader, stuck keys, logind handler and lease
+    pub fn remove_device(&self, session: &LogindSession, devnum: u64) {
+        let Some(dev) = self.detach_device(devnum) else {
+            return;
+        };
+        session.forget_device(devnum);
+        session.release_device(devnum);
+        println!("carrot: input: {} removed", dev.name);
     }
 }
 
@@ -379,5 +432,58 @@ impl Device {
                 }
             }
         })));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    fn fake_device(devnum: u64) -> Rc<Device> {
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        Rc::new(Device {
+            devnum,
+            name: "test kbd".into(),
+            kind: DeviceKind::Keyboard,
+            fd: RefCell::new(Rc::new(fd)),
+            active: Cell::new(true),
+            pressed: RefCell::new([30u32].into_iter().collect()),
+            reader: Cell::new(None),
+        })
+    }
+
+    #[test]
+    fn detach_unlists_releases_keys_and_is_idempotent() {
+        let mgr = Manager {
+            devices: RefCell::new(Vec::new()),
+            sink: Rc::new(AsyncQueue::default()),
+        };
+        mgr.devices.borrow_mut().push(fake_device(42));
+
+        let dev = mgr.detach_device(42).expect("device was listed");
+        assert!(mgr.devices.borrow().is_empty());
+        assert!(!dev.active.get());
+        assert!(dev.pressed.borrow().is_empty());
+
+        // the held key was synthesized as a release
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut pop = mgr.sink.pop();
+        let Poll::Ready((devnum, ev)) = std::pin::Pin::new(&mut pop).poll(&mut cx) else {
+            panic!("no synthesized release in the sink");
+        };
+        assert_eq!(devnum, 42);
+        assert!(matches!(
+            ev,
+            InputEvent::Key {
+                key: 30,
+                pressed: false,
+                ..
+            }
+        ));
+
+        // second detach is a no-op
+        assert!(mgr.detach_device(42).is_none());
     }
 }

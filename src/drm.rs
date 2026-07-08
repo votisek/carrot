@@ -7,7 +7,7 @@ pub mod atomic;
 pub mod connector;
 pub mod device;
 pub mod sys;
-mod uevent;
+pub mod uevent;
 
 /// obj ids and prop ids travel together; typing them apart turns a
 /// transposition into a compile error, not a silent garbage commit. sys.rs

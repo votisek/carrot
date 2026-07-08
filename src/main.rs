@@ -265,6 +265,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         *st.session.borrow_mut() = session;
         *st.display.borrow_mut() = display;
+        output::start_hotplug(&st);
     });
 
     let listen_fd = std::rc::Rc::new(sock.fd.try_clone()?);

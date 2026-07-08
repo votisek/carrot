@@ -29,6 +29,8 @@ pub struct Display {
     out: Rc<Output>,
     _pump: SpawnedFuture<()>,
     _present: SpawnedFuture<()>,
+    /// armed once the display lands in state; watches netlink for hotplug
+    pub hotplug: RefCell<Option<SpawnedFuture<()>>>,
 }
 
 impl Display {
@@ -219,6 +221,7 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
                     out,
                     _pump: pump,
                     _present: present,
+                    hotplug: RefCell::new(None),
                 });
             }
             Err(e) => {
@@ -970,5 +973,69 @@ fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Ve
             ],
             color,
         });
+    }
+}
+
+/// watch netlink for input device add/remove and keep the evdev manager in
+/// sync. fresh event nodes lag their uevent, so adds go through a worker that
+/// delays each a beat and serializes them, closing the duplicate-uevent race
+pub fn start_hotplug(state: &Rc<State>) {
+    if state.display.borrow().is_none() {
+        return;
+    }
+    let st = state.clone();
+    let task = state.eng.spawn("input hotplug", async move {
+        let fd = match crate::drm::uevent::open() {
+            Ok(fd) => Rc::new(fd),
+            Err(e) => {
+                eprintln!("carrot: hotplug disabled: {e}");
+                return;
+            }
+        };
+        let adds: Rc<crate::util::AsyncQueue<String>> = Rc::new(Default::default());
+        let aq = adds.clone();
+        let ast = st.clone();
+        let _adder = st.eng.spawn("input hotplug add", async move {
+            loop {
+                let devname = aq.pop().await;
+                let deadline = Time::from_nsec(Time::now().nsec() + 250_000_000);
+                let _ = ast.ring.timeout(deadline).await;
+                let session = ast.session.borrow().clone();
+                let mgr = ast.input.borrow().as_ref().map(|i| i.mgr.clone());
+                let (Some(session), Some(mgr)) = (session, mgr) else {
+                    continue;
+                };
+                let path = std::path::PathBuf::from(format!("/dev/{devname}"));
+                if let Some(dev) = mgr.add_device(&ast, &session, &path).await {
+                    println!("carrot: input: {} added", dev.name);
+                }
+            }
+        });
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (b, n) = match st.ring.read(&fd, buf).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("carrot: hotplug read failed: {e:?}");
+                    return;
+                }
+            };
+            buf = b;
+            let msg = &buf[..n];
+            if let Some((added, devname)) = crate::drm::uevent::input_change(msg) {
+                if added {
+                    adds.push(devname);
+                } else if let Some(devnum) = crate::drm::uevent::devnum(msg) {
+                    let session = st.session.borrow().clone();
+                    let mgr = st.input.borrow().as_ref().map(|i| i.mgr.clone());
+                    if let (Some(session), Some(mgr)) = (session, mgr) {
+                        mgr.remove_device(&session, devnum);
+                    }
+                }
+            }
+        }
+    });
+    if let Some(d) = state.display.borrow().as_ref() {
+        *d.hotplug.borrow_mut() = Some(task);
     }
 }
