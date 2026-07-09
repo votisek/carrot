@@ -202,6 +202,7 @@ fn general(v: &Value, cfg: &mut Config) -> Result<(), String> {
             "active_border" => cfg.border_focused = color(&need_str(&v, &key)?, &key)?,
             "inactive_border" => cfg.border_unfocused = color(&need_str(&v, &key)?, &key)?,
             "allow_tearing" => cfg.allow_tearing = need_bool(&v, &key)?,
+            "software_cursor" => cfg.software_cursor = need_bool(&v, &key)?,
             "float_above_fullscreen" => cfg.float_above_fullscreen = need_bool(&v, &key)?,
             "layout" => {
                 cfg.layout = need_str(&v, &key)?;
@@ -712,7 +713,7 @@ mod tests {
                 general = {
                     gaps_in = 5, gaps_out = 10, border_size = 2,
                     active_border = "89b4fa", inactive_border = "585b70",
-                    allow_tearing = true,
+                    allow_tearing = true, software_cursor = true,
                 },
                 input = { accel_profile = "flat", natural_scroll = true, repeat_rate = 35 },
                 devices = { ["turtle-beach"] = { accel_speed = -0.86 } },
@@ -727,7 +728,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.gaps_in, 5);
         assert_eq!(cfg.border, 2);
-        assert!(cfg.allow_tearing);
+        assert!(cfg.allow_tearing && cfg.software_cursor);
         assert_eq!(cfg.input.accel_profile.as_deref(), Some("flat"));
         assert_eq!(cfg.repeat_rate, 35);
         assert_eq!(cfg.devices[0].accel_speed, Some(-0.86));
@@ -754,6 +755,7 @@ mod tests {
                 float-above-fullscreen #true
                 layout "dwindle"
                 allow-tearing #true
+                software-cursor #true
             }
             input {
                 repeat-rate 35
@@ -843,7 +845,7 @@ mod tests {
                     gaps_in = 4, gaps_out = 8, border_size = 2,
                     active_border = "89b4fa", inactive_border = "585b70cc",
                     float_above_fullscreen = true, layout = "dwindle",
-                    allow_tearing = true,
+                    allow_tearing = true, software_cursor = true,
                 },
                 input = {
                     repeat_rate = 35, repeat_delay = 250,
