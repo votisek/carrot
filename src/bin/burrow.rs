@@ -62,6 +62,12 @@ fn block(cmd: &str, it: &serde_json::Value) {
         let active = if it["active"].as_bool().unwrap_or(false) { " (active)" } else { "" };
         println!("Workspace {}{active}:", plain(&it["index"]));
         skip.extend(["index", "active"]);
+    } else if cmd == "monitors" {
+        let focused = if it["focused"].as_bool().unwrap_or(false) { " (focused)" } else { "" };
+        println!("Monitor {}{focused}:", plain(&it["name"]));
+        println!("    at: {},{}", plain(&it["x"]), plain(&it["y"]));
+        println!("    size: {},{}", plain(&it["width"]), plain(&it["height"]));
+        skip.extend(["name", "focused", "x", "y", "width", "height"]);
     } else {
         match it.get("id") {
             Some(id) => println!(

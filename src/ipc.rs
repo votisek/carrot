@@ -138,6 +138,7 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
         return Ok(json!(true));
     }
     match serde_json::from_str::<String>(line).as_deref() {
+        Ok("monitors") => Ok(monitors_json(state)),
         Ok("workspaces") => Ok(workspaces_json(state)),
         Ok("windows") => Ok(windows_json(state)),
         Ok("reload") => reload(state).map(|_| json!(true)),
@@ -242,6 +243,35 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
 }
 
 // -- queries --
+
+fn monitors_json(state: &Rc<State>) -> Value {
+    let focused = state.focused_output.get();
+    let d = state.display.borrow();
+    let outs: Vec<Value> = d
+        .as_ref()
+        .map(|d| {
+            d.outputs
+                .borrow()
+                .iter()
+                .map(|o| {
+                    let (x, y) = o.pos.get();
+                    json!({
+                        "name": o.conn.name,
+                        "x": x,
+                        "y": y,
+                        "width": o.width,
+                        "height": o.height,
+                        // no fractional scale yet; honest constant
+                        "scale": 1.0,
+                        "workspace": o.ws.get() + 1,
+                        "focused": o.index.get() == focused,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!(outs)
+}
 
 fn workspaces_json(state: &Rc<State>) -> Value {
     let list = state.workspaces.borrow();
