@@ -354,6 +354,19 @@ pub(crate) mod test_utils {
         (state, client)
     }
 
+    /// every queued event as (object, opcode), in send order
+    pub(crate) fn event_seq(bytes: &[u8]) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off + 8 <= bytes.len() {
+            let obj = u32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
+            let w2 = u32::from_ne_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            out.push((obj, w2 & 0xffff));
+            off += ((w2 >> 16) as usize).max(8);
+        }
+        out
+    }
+
     pub(crate) fn count_events(bytes: &[u8], object: ObjectId, opcode: u32) -> usize {
         let mut n = 0;
         let mut off = 0;

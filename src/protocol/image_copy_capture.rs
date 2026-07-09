@@ -875,3 +875,299 @@ pub fn drop_client(state: &Rc<State>, id: ClientId) {
     state.icc_sessions.borrow_mut().retain(|s| s.client.id != id);
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::test_utils::{count_events, event_seq, test_client};
+    use crate::protocol::MIN_SERVER_ID;
+    use crate::shell::xdg::test_support::{mapped_toplevel, unmap_toplevel};
+    use cursor_session_v1::Handler as _;
+    use frame_v1::Handler as _;
+    use manager_v1::Handler as _;
+    use session_v1::Handler as _;
+    use toplevel_source_mgr_v1::Handler as _;
+
+    const ERR: ObjectId = ObjectId(1);
+    const HANDLE: ObjectId = ObjectId(MIN_SERVER_ID);
+    const SOURCE: ObjectId = ObjectId(72);
+    const SESSION: ObjectId = ObjectId(73);
+    const FRAME: ObjectId = ObjectId(74);
+
+    /// mapped toplevel + ext handle + toplevel capture source + icc manager
+    fn setup() -> (Rc<State>, Rc<Client>, Rc<WlSurface>, Rc<IccManager>) {
+        let (state, client) = test_client();
+        let (s, _xdg, _tl) = mapped_toplevel(&state, &client, [30, 10, 40, 50, 20]);
+        crate::protocol::foreign_toplevel_list::ForeignToplevelListGlobal
+            .bind(&client, ObjectId(60), 1)
+            .unwrap();
+        let tsm = Rc::new(ToplevelSourceManager {
+            id: ObjectId(70),
+            client: client.clone(),
+            version: 1,
+        });
+        client.add_client_obj(tsm.clone()).unwrap();
+        tsm.create_source(toplevel_source_mgr_v1::create_source::Request {
+            source: SOURCE,
+            toplevel_handle: HANDLE,
+        })
+        .unwrap();
+        let mgr = Rc::new(IccManager {
+            id: ObjectId(71),
+            client: client.clone(),
+            version: 1,
+        });
+        client.add_client_obj(mgr.clone()).unwrap();
+        (state, client, s, mgr)
+    }
+
+    fn make_session(state: &Rc<State>, mgr: &Rc<IccManager>) -> Rc<IccSession> {
+        mgr.create_session(manager_v1::create_session::Request {
+            session: SESSION,
+            source: SOURCE,
+            options: 0,
+        })
+        .unwrap();
+        state
+            .icc_sessions
+            .borrow()
+            .iter()
+            .find(|s| s.id == SESSION)
+            .cloned()
+            .unwrap()
+    }
+
+    fn make_frame(client: &Rc<Client>, sess: &Rc<IccSession>) -> Rc<IccFrame> {
+        sess.create_frame(session_v1::create_frame::Request { frame: FRAME })
+            .unwrap();
+        let f = sess.frame.borrow().clone().unwrap();
+        // a buffer the size of the advertised constraints
+        let r = {
+            let SourceKind::Toplevel(w) = &sess.source else { unreachable!() };
+            let win = w.borrow().upgrade().unwrap();
+            win.draw_rect(&client.state)
+        };
+        let b = crate::protocol::shm::test_buffer(client, ObjectId(75), r.width(), r.height());
+        f.attach_buffer(frame_v1::attach_buffer::Request { buffer: b.id })
+            .unwrap();
+        f
+    }
+
+    #[test]
+    fn session_bursts_constraints_then_one_done() {
+        let (state, client, _s, mgr) = setup();
+        let before = client.queued_out_bytes().len();
+        make_session(&state, &mgr);
+        let bytes = client.queued_out_bytes();
+        let tail = &bytes[before..];
+        let seq = event_seq(tail);
+        assert_eq!(
+            seq,
+            vec![
+                (SESSION.0, session_v1::shm_format::OPCODE),
+                (SESSION.0, session_v1::shm_format::OPCODE),
+                (SESSION.0, session_v1::buffer_size::OPCODE),
+                (SESSION.0, session_v1::done::OPCODE),
+            ]
+        );
+        // XRGB8888 leads: clients that allocate formats[0] get the safe one
+        let first_format = u32::from_ne_bytes(tail[8..12].try_into().unwrap());
+        assert_eq!(first_format, WL_SHM_XRGB8888);
+        assert_eq!(count_events(tail, SESSION, session_v1::stopped::OPCODE), 0);
+    }
+
+    #[test]
+    fn dead_source_session_stops_instead() {
+        let (state, client, s, mgr) = setup();
+        unmap_toplevel(&s);
+        let before = client.queued_out_bytes().len();
+        mgr.create_session(manager_v1::create_session::Request {
+            session: SESSION,
+            source: SOURCE,
+            options: 0,
+        })
+        .unwrap();
+        let bytes = client.queued_out_bytes();
+        let tail = &bytes[before..];
+        assert_eq!(count_events(tail, SESSION, session_v1::stopped::OPCODE), 1);
+        assert_eq!(count_events(tail, SESSION, session_v1::done::OPCODE), 0);
+        assert!(state.icc_sessions.borrow().is_empty());
+    }
+
+    #[test]
+    fn unknown_option_bits_are_an_error() {
+        let (_state, client, _s, mgr) = setup();
+        mgr.create_session(manager_v1::create_session::Request {
+            session: SESSION,
+            source: SOURCE,
+            options: 2,
+        })
+        .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 1);
+    }
+
+    #[test]
+    fn second_frame_is_duplicate_frame() {
+        let (state, client, _s, mgr) = setup();
+        let sess = make_session(&state, &mgr);
+        sess.create_frame(session_v1::create_frame::Request { frame: FRAME })
+            .unwrap();
+        sess.create_frame(session_v1::create_frame::Request { frame: ObjectId(76) })
+            .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 1);
+    }
+
+    #[test]
+    fn capture_without_a_buffer_is_no_buffer() {
+        let (state, client, _s, mgr) = setup();
+        let sess = make_session(&state, &mgr);
+        sess.create_frame(session_v1::create_frame::Request { frame: FRAME })
+            .unwrap();
+        let f = sess.frame.borrow().clone().unwrap();
+        f.capture(frame_v1::capture::Request {}).unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 1);
+    }
+
+    #[test]
+    fn bad_damage_rects_are_an_error() {
+        let (state, client, _s, mgr) = setup();
+        let sess = make_session(&state, &mgr);
+        let f = make_frame(&client, &sess);
+        f.damage_buffer(frame_v1::damage_buffer::Request {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+        })
+        .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 0, "valid rect passes");
+        f.damage_buffer(frame_v1::damage_buffer::Request {
+            x: -1,
+            y: 0,
+            width: 16,
+            height: 16,
+        })
+        .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 1);
+    }
+
+    #[test]
+    fn stopped_precedes_the_frames_failure() {
+        let (state, client, s, mgr) = setup();
+        let sess = make_session(&state, &mgr);
+        let f = make_frame(&client, &sess);
+        // park the capture on the content-change path
+        sess.force.set(false);
+        f.capture(frame_v1::capture::Request {}).unwrap();
+        assert!(sess.status.get() == FrameStatus::Capturing);
+        let before = client.queued_out_bytes().len();
+        unmap_toplevel(&s);
+        let bytes = client.queued_out_bytes();
+        let seq: Vec<_> = event_seq(&bytes[before..])
+            .into_iter()
+            .filter(|&(obj, _)| obj == SESSION.0 || obj == FRAME.0)
+            .collect();
+        assert_eq!(
+            seq,
+            vec![
+                (SESSION.0, session_v1::stopped::OPCODE),
+                (FRAME.0, frame_v1::failed::OPCODE),
+            ]
+        );
+        assert!(state.icc_sessions.borrow().is_empty());
+    }
+
+    #[test]
+    fn requests_after_capture_are_already_captured() {
+        let (state, client, s, mgr) = setup();
+        let sess = make_session(&state, &mgr);
+        let f = make_frame(&client, &sess);
+        unmap_toplevel(&s);
+        // capture on a stopped session fails, never a protocol error
+        let before = client.queued_out_bytes().len();
+        f.capture(frame_v1::capture::Request {}).unwrap();
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes[before..], ERR, 0), 0);
+        assert_eq!(
+            count_events(&bytes[before..], FRAME, frame_v1::failed::OPCODE),
+            1
+        );
+        // the frame is spent now: everything else is already_captured
+        f.attach_buffer(frame_v1::attach_buffer::Request { buffer: ObjectId(75) })
+            .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 1);
+    }
+
+    #[test]
+    fn frame_destroy_frees_the_session_slot() {
+        let (state, client, _s, mgr) = setup();
+        let sess = make_session(&state, &mgr);
+        let f = make_frame(&client, &sess);
+        f.destroy(frame_v1::destroy::Request {}).unwrap();
+        assert!(sess.frame.borrow().is_none());
+        assert!(sess.buffer.borrow().is_none());
+        assert!(sess.status.get() == FrameStatus::Unused);
+        // the slot is free for the next frame
+        sess.create_frame(session_v1::create_frame::Request { frame: ObjectId(76) })
+            .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 0);
+    }
+
+    #[test]
+    fn ready_metadata_is_ordered() {
+        let (state, _client, _s, mgr) = setup();
+        let sess = make_session(&state, &mgr);
+        let before = sess.client.queued_out_bytes().len();
+        send_ready(&sess, ObjectId(99), 64, 64);
+        let bytes = sess.client.queued_out_bytes();
+        assert_eq!(
+            event_seq(&bytes[before..]),
+            vec![
+                (99, frame_v1::transform::OPCODE),
+                (99, frame_v1::damage::OPCODE),
+                (99, frame_v1::presentation_time::OPCODE),
+                (99, frame_v1::ready::OPCODE),
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_sessions_stop_immediately() {
+        let (_state, client, _s, mgr) = setup();
+        mgr.create_pointer_cursor_session(manager_v1::create_pointer_cursor_session::Request {
+            session: ObjectId(80),
+            source: SOURCE,
+            pointer: ObjectId(71),
+        })
+        .unwrap();
+        assert!(client.objects.get(ObjectId(80)).is_some());
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 0);
+        let src = client.objects.capture_source(SOURCE).unwrap();
+        let cs = Rc::new(IccCursorSession {
+            id: ObjectId(81),
+            client: client.clone(),
+            version: 1,
+            source: src.kind.snapshot(),
+            have_session: Cell::new(false),
+        });
+        client.add_client_obj(cs.clone()).unwrap();
+        let before = client.queued_out_bytes().len();
+        cs.get_capture_session(cursor_session_v1::get_capture_session::Request {
+            session: ObjectId(82),
+        })
+        .unwrap();
+        let bytes = client.queued_out_bytes();
+        let tail = &bytes[before..];
+        // stopped at birth, never constraints
+        assert_eq!(
+            count_events(tail, ObjectId(82), session_v1::stopped::OPCODE),
+            1
+        );
+        assert_eq!(count_events(tail, ObjectId(82), session_v1::done::OPCODE), 0);
+        // only one capture session per cursor session
+        cs.get_capture_session(cursor_session_v1::get_capture_session::Request {
+            session: ObjectId(83),
+        })
+        .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 1);
+    }
+}

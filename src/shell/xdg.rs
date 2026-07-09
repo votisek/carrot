@@ -2444,3 +2444,69 @@ mod tests {
         assert_eq!(win1.rect.get().x2, 80);
     }
 }
+
+// -- test scaffolding shared with the capture protocol suites --
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::protocol::interfaces::wl_surface;
+    use wl_surface::Handler as _;
+    use xdg_surface::Handler as _;
+    use xdg_wm_base::Handler as _;
+
+    /// a mapped toplevel driven through the real request path.
+    /// ids = [base, surface, xdg, toplevel, buffer], all unused client ids.
+    pub(crate) fn mapped_toplevel(
+        state: &Rc<State>,
+        client: &Rc<Client>,
+        ids: [u32; 5],
+    ) -> (Rc<WlSurface>, Rc<XdgSurface>, Rc<XdgToplevel>) {
+        let [bid, sid, xid, tid, bufid] = ids;
+        if state.output_size.get() == (0, 0) {
+            state.output_size.set((800, 600));
+        }
+        let base = Rc::new_cyclic(|me| XdgWmBase {
+            id: ObjectId(bid),
+            client: client.clone(),
+            version: 6,
+            me: me.clone(),
+            surfaces: RefCell::new(HashMap::new()),
+        });
+        client.add_client_obj(base.clone()).unwrap();
+        let s = WlSurface::new(ObjectId(sid), client, 6);
+        client.add_client_obj(s.clone()).unwrap();
+        client.objects.track_surface(s.clone());
+        base.get_xdg_surface(xdg_wm_base::get_xdg_surface::Request {
+            id: ObjectId(xid),
+            surface: ObjectId(sid),
+        })
+        .unwrap();
+        let xdg = base.surfaces.borrow().get(&ObjectId(xid)).cloned().unwrap();
+        xdg.get_toplevel(xdg_surface::get_toplevel::Request { id: ObjectId(tid) })
+            .unwrap();
+        let tl = xdg.toplevel().unwrap();
+        s.commit(wl_surface::commit::Request {}).unwrap();
+        flush_configures(state);
+        xdg.ack_configure(xdg_surface::ack_configure::Request {
+            serial: xdg.last_sent.get(),
+        })
+        .unwrap();
+        let b = crate::protocol::shm::test_buffer(client, ObjectId(bufid), 64, 64);
+        s.attach(wl_surface::attach::Request { buffer: b.id, x: 0, y: 0 })
+            .unwrap();
+        s.commit(wl_surface::commit::Request {}).unwrap();
+        (s, xdg, tl)
+    }
+
+    /// null attach + commit: the toplevel unmaps
+    pub(crate) fn unmap_toplevel(s: &Rc<WlSurface>) {
+        s.attach(wl_surface::attach::Request {
+            buffer: ObjectId::NONE,
+            x: 0,
+            y: 0,
+        })
+        .unwrap();
+        s.commit(wl_surface::commit::Request {}).unwrap();
+    }
+}
