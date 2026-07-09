@@ -1,4 +1,4 @@
-// the wl_protocol! declarations. golden wire tests pin every opcode.
+// golden wire tests pin every opcode.
 
 crate::wl_protocol! {
     interface wl_display, version = 1;
@@ -236,6 +236,270 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface ext_idle_notifier_v1, version = 1;
+    request destroy();
+    request get_idle_notification(id: new_id, timeout: uint, seat: object);
+}
+
+crate::wl_protocol! {
+    interface ext_idle_notification_v1, version = 1;
+    request destroy();
+    event idled();
+    event resumed();
+}
+
+crate::wl_protocol! {
+    interface zwp_idle_inhibit_manager_v1, version = 1;
+    request destroy();
+    request create_inhibitor(id: new_id, surface: object);
+}
+
+crate::wl_protocol! {
+    interface zwp_idle_inhibitor_v1, version = 1;
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface zwlr_foreign_toplevel_manager_v1, version = 3;
+    request stop();
+    event toplevel(toplevel: new_id);
+    event finished();
+}
+
+crate::wl_protocol! {
+    interface zwlr_foreign_toplevel_handle_v1, version = 3;
+    request set_maximized();
+    request unset_maximized();
+    request set_minimized();
+    request unset_minimized();
+    request activate(seat: object);
+    request close();
+    request set_rectangle(surface: object, x: int, y: int, width: int, height: int);
+    request destroy();
+    request set_fullscreen(output: object) since 2;
+    request unset_fullscreen() since 2;
+    event title(title: string);
+    event app_id(app_id: string);
+    event output_enter(output: object);
+    event output_leave(output: object);
+    event state(state: array);
+    event done();
+    event closed();
+    event parent(parent: object) since 3;
+}
+
+crate::wl_protocol! {
+    interface zwlr_data_control_manager_v1, version = 2;
+    request create_data_source(id: new_id);
+    request get_data_device(id: new_id, seat: object);
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface zwlr_data_control_device_v1, version = 2;
+    request set_selection(source: object);
+    request destroy();
+    request set_primary_selection(source: object) since 2;
+    event data_offer(id: new_id);
+    event selection(id: object);
+    event finished();
+    event primary_selection(id: object) since 2;
+}
+
+crate::wl_protocol! {
+    interface zwlr_data_control_source_v1, version = 1;
+    request offer(mime_type: string);
+    request destroy();
+    event send(mime_type: string, fd: fd);
+    event cancelled();
+}
+
+crate::wl_protocol! {
+    interface zwlr_data_control_offer_v1, version = 1;
+    request receive(mime_type: string, fd: fd);
+    request destroy();
+    event offer(mime_type: string);
+}
+
+crate::wl_protocol! {
+    interface zwlr_screencopy_manager_v1, version = 3;
+    request capture_output(frame: new_id, overlay_cursor: int, output: object);
+    request capture_output_region(frame: new_id, overlay_cursor: int, output: object, x: int, y: int, width: int, height: int);
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface zwlr_screencopy_frame_v1, version = 3;
+    request copy(buffer: object);
+    request destroy();
+    request copy_with_damage(buffer: object) since 2;
+    event buffer(format: uint, width: uint, height: uint, stride: uint);
+    event flags(flags: uint);
+    event ready(tv_sec_hi: uint, tv_sec_lo: uint, tv_nsec: uint);
+    event failed();
+    event damage(x: uint, y: uint, width: uint, height: uint) since 2;
+    event linux_dmabuf(format: uint, width: uint, height: uint) since 3;
+    event buffer_done() since 3;
+}
+
+crate::wl_protocol! {
+    interface ext_foreign_toplevel_list_v1, version = 1;
+    request stop();
+    request destroy();
+    event toplevel(toplevel: new_id);
+    event finished();
+}
+
+crate::wl_protocol! {
+    interface ext_foreign_toplevel_handle_v1, version = 1;
+    request destroy();
+    event closed();
+    event done();
+    event title(title: string);
+    event app_id(app_id: string);
+    event identifier(identifier: string);
+}
+
+crate::wl_protocol! {
+    interface ext_image_capture_source_v1, version = 1;
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface ext_output_image_capture_source_manager_v1, version = 1;
+    request create_source(source: new_id, output: object);
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface ext_foreign_toplevel_image_capture_source_manager_v1, version = 1;
+    request create_source(source: new_id, toplevel_handle: object);
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface ext_image_copy_capture_manager_v1, version = 1;
+    request create_session(session: new_id, source: object, options: uint);
+    request create_pointer_cursor_session(session: new_id, source: object, pointer: object);
+    request destroy();
+}
+
+crate::wl_protocol! {
+    interface ext_image_copy_capture_session_v1, version = 1;
+    request create_frame(frame: new_id);
+    request destroy();
+    event buffer_size(width: uint, height: uint);
+    event shm_format(format: uint);
+    event dmabuf_device(device: array);
+    event dmabuf_format(format: uint, modifiers: array);
+    event done();
+    event stopped();
+}
+
+crate::wl_protocol! {
+    interface ext_image_copy_capture_frame_v1, version = 1;
+    request destroy();
+    request attach_buffer(buffer: object);
+    request damage_buffer(x: int, y: int, width: int, height: int);
+    request capture();
+    event transform(transform: uint);
+    event damage(x: int, y: int, width: int, height: int);
+    event presentation_time(tv_sec_hi: uint, tv_sec_lo: uint, tv_nsec: uint);
+    event ready();
+    event failed(reason: uint);
+}
+
+crate::wl_protocol! {
+    interface ext_image_copy_capture_cursor_session_v1, version = 1;
+    request destroy();
+    request get_capture_session(session: new_id);
+    event enter();
+    event leave();
+    event position(x: int, y: int);
+    event hotspot(x: int, y: int);
+}
+
+crate::wl_protocol! {
+    interface zwp_linux_dmabuf_v1, version = 4;
+    request destroy();
+    request create_params(params_id: new_id);
+    request get_default_feedback(id: new_id) since 4;
+    request get_surface_feedback(id: new_id, surface: object) since 4;
+    event format(format: uint);
+    event modifier(format: uint, modifier_hi: uint, modifier_lo: uint) since 3;
+}
+
+crate::wl_protocol! {
+    interface zwp_linux_dmabuf_feedback_v1, version = 4;
+    request destroy();
+    event done();
+    event format_table(fd: fd, size: uint);
+    event main_device(device: array);
+    event tranche_done();
+    event tranche_target_device(device: array);
+    event tranche_formats(indices: array);
+    event tranche_flags(flags: uint);
+}
+
+crate::wl_protocol! {
+    interface zwp_linux_buffer_params_v1, version = 4;
+    request destroy();
+    request add(fd: fd, plane_idx: uint, offset: uint, stride: uint, modifier_hi: uint, modifier_lo: uint);
+    request create(width: int, height: int, format: uint, flags: uint);
+    request create_immed(buffer_id: new_id, width: int, height: int, format: uint, flags: uint) since 2;
+    event created(buffer: new_id);
+    event failed();
+}
+
+crate::wl_protocol! {
+    interface zwp_relative_pointer_manager_v1, version = 1;
+    request destroy();
+    request get_relative_pointer(id: new_id, pointer: object);
+}
+
+crate::wl_protocol! {
+    interface zwp_relative_pointer_v1, version = 1;
+    request destroy();
+    event relative_motion(utime_hi: uint, utime_lo: uint, dx: fixed, dy: fixed, dx_unaccel: fixed, dy_unaccel: fixed);
+}
+
+crate::wl_protocol! {
+    interface zwp_pointer_constraints_v1, version = 1;
+    request destroy();
+    request lock_pointer(id: new_id, surface: object, pointer: object, region: object, lifetime: uint);
+    request confine_pointer(id: new_id, surface: object, pointer: object, region: object, lifetime: uint);
+}
+
+crate::wl_protocol! {
+    interface zwp_locked_pointer_v1, version = 1;
+    request destroy();
+    request set_cursor_position_hint(surface_x: fixed, surface_y: fixed);
+    request set_region(region: object);
+    event locked();
+    event unlocked();
+}
+
+crate::wl_protocol! {
+    interface zwp_confined_pointer_v1, version = 1;
+    request destroy();
+    request set_region(region: object);
+    event confined();
+    event unconfined();
+}
+
+crate::wl_protocol! {
+    interface wp_tearing_control_manager_v1, version = 1;
+    request destroy();
+    request get_tearing_control(id: new_id, surface: object);
+}
+
+crate::wl_protocol! {
+    interface wp_tearing_control_v1, version = 1;
+    request set_presentation_hint(hint: uint);
+    request destroy();
+}
+
+crate::wl_protocol! {
     interface zxdg_decoration_manager_v1, version = 1;
     request destroy();
     request get_toplevel_decoration(id: new_id, toplevel: object);
@@ -338,270 +602,6 @@ crate::wl_protocol! {
     event scale(factor: int) since 2;
     event name(name: string) since 4;
     event description(description: string) since 4;
-}
-
-crate::wl_protocol! {
-    interface zwp_linux_dmabuf_v1, version = 4;
-    request destroy();
-    request create_params(params_id: new_id);
-    request get_default_feedback(id: new_id) since 4;
-    request get_surface_feedback(id: new_id, surface: object) since 4;
-    event format(format: uint);
-    event modifier(format: uint, modifier_hi: uint, modifier_lo: uint) since 3;
-}
-
-crate::wl_protocol! {
-    interface zwp_linux_dmabuf_feedback_v1, version = 4;
-    request destroy();
-    event done();
-    event format_table(fd: fd, size: uint);
-    event main_device(device: array);
-    event tranche_done();
-    event tranche_target_device(device: array);
-    event tranche_formats(indices: array);
-    event tranche_flags(flags: uint);
-}
-
-crate::wl_protocol! {
-    interface zwp_linux_buffer_params_v1, version = 4;
-    request destroy();
-    request add(fd: fd, plane_idx: uint, offset: uint, stride: uint, modifier_hi: uint, modifier_lo: uint);
-    request create(width: int, height: int, format: uint, flags: uint);
-    request create_immed(buffer_id: new_id, width: int, height: int, format: uint, flags: uint) since 2;
-    event created(buffer: new_id);
-    event failed();
-}
-
-crate::wl_protocol! {
-    interface zwlr_data_control_manager_v1, version = 2;
-    request create_data_source(id: new_id);
-    request get_data_device(id: new_id, seat: object);
-    request destroy();
-}
-
-crate::wl_protocol! {
-    interface zwlr_data_control_device_v1, version = 2;
-    request set_selection(source: object);
-    request destroy();
-    request set_primary_selection(source: object) since 2;
-    event data_offer(id: new_id);
-    event selection(id: object);
-    event finished();
-    event primary_selection(id: object) since 2;
-}
-
-crate::wl_protocol! {
-    interface zwlr_data_control_source_v1, version = 1;
-    request offer(mime_type: string);
-    request destroy();
-    event send(mime_type: string, fd: fd);
-    event cancelled();
-}
-
-crate::wl_protocol! {
-    interface zwlr_data_control_offer_v1, version = 1;
-    request receive(mime_type: string, fd: fd);
-    request destroy();
-    event offer(mime_type: string);
-}
-
-crate::wl_protocol! {
-    interface ext_idle_notifier_v1, version = 1;
-    request destroy();
-    request get_idle_notification(id: new_id, timeout: uint, seat: object);
-}
-
-crate::wl_protocol! {
-    interface ext_idle_notification_v1, version = 1;
-    request destroy();
-    event idled();
-    event resumed();
-}
-
-crate::wl_protocol! {
-    interface zwp_idle_inhibit_manager_v1, version = 1;
-    request destroy();
-    request create_inhibitor(id: new_id, surface: object);
-}
-
-crate::wl_protocol! {
-    interface zwp_idle_inhibitor_v1, version = 1;
-    request destroy();
-}
-
-crate::wl_protocol! {
-    interface zwlr_screencopy_manager_v1, version = 3;
-    request capture_output(frame: new_id, overlay_cursor: int, output: object);
-    request capture_output_region(frame: new_id, overlay_cursor: int, output: object, x: int, y: int, width: int, height: int);
-    request destroy();
-}
-
-crate::wl_protocol! {
-    interface zwlr_screencopy_frame_v1, version = 3;
-    request copy(buffer: object);
-    request destroy();
-    request copy_with_damage(buffer: object) since 2;
-    event buffer(format: uint, width: uint, height: uint, stride: uint);
-    event flags(flags: uint);
-    event ready(tv_sec_hi: uint, tv_sec_lo: uint, tv_nsec: uint);
-    event failed();
-    event damage(x: uint, y: uint, width: uint, height: uint) since 2;
-    event linux_dmabuf(format: uint, width: uint, height: uint) since 3;
-    event buffer_done() since 3;
-}
-
-crate::wl_protocol! {
-    interface ext_foreign_toplevel_list_v1, version = 1;
-    request stop();
-    request destroy();
-    event toplevel(toplevel: new_id);
-    event finished();
-}
-
-crate::wl_protocol! {
-    interface ext_foreign_toplevel_handle_v1, version = 1;
-    request destroy();
-    event closed();
-    event done();
-    event title(title: string);
-    event app_id(app_id: string);
-    event identifier(identifier: string);
-}
-
-crate::wl_protocol! {
-    interface ext_image_capture_source_v1, version = 1;
-    request destroy();
-}
-
-crate::wl_protocol! {
-    interface ext_output_image_capture_source_manager_v1, version = 1;
-    request create_source(source: new_id, output: object);
-    request destroy();
-}
-
-crate::wl_protocol! {
-    interface ext_foreign_toplevel_image_capture_source_manager_v1, version = 1;
-    request create_source(source: new_id, toplevel_handle: object);
-    request destroy();
-}
-
-crate::wl_protocol! {
-    interface ext_image_copy_capture_manager_v1, version = 1;
-    request create_session(session: new_id, source: object, options: uint);
-    request create_pointer_cursor_session(session: new_id, source: object, pointer: object);
-    request destroy();
-}
-
-crate::wl_protocol! {
-    interface ext_image_copy_capture_session_v1, version = 1;
-    request create_frame(frame: new_id);
-    request destroy();
-    event buffer_size(width: uint, height: uint);
-    event shm_format(format: uint);
-    event dmabuf_device(device: array);
-    event dmabuf_format(format: uint, modifiers: array);
-    event done();
-    event stopped();
-}
-
-crate::wl_protocol! {
-    interface ext_image_copy_capture_frame_v1, version = 1;
-    request destroy();
-    request attach_buffer(buffer: object);
-    request damage_buffer(x: int, y: int, width: int, height: int);
-    request capture();
-    event transform(transform: uint);
-    event damage(x: int, y: int, width: int, height: int);
-    event presentation_time(tv_sec_hi: uint, tv_sec_lo: uint, tv_nsec: uint);
-    event ready();
-    event failed(reason: uint);
-}
-
-crate::wl_protocol! {
-    interface ext_image_copy_capture_cursor_session_v1, version = 1;
-    request destroy();
-    request get_capture_session(session: new_id);
-    event enter();
-    event leave();
-    event position(x: int, y: int);
-    event hotspot(x: int, y: int);
-}
-
-crate::wl_protocol! {
-    interface zwlr_foreign_toplevel_manager_v1, version = 3;
-    request stop();
-    event toplevel(toplevel: new_id);
-    event finished();
-}
-
-crate::wl_protocol! {
-    interface zwlr_foreign_toplevel_handle_v1, version = 3;
-    request set_maximized();
-    request unset_maximized();
-    request set_minimized();
-    request unset_minimized();
-    request activate(seat: object);
-    request close();
-    request set_rectangle(surface: object, x: int, y: int, width: int, height: int);
-    request destroy();
-    request set_fullscreen(output: object) since 2;
-    request unset_fullscreen() since 2;
-    event title(title: string);
-    event app_id(app_id: string);
-    event output_enter(output: object);
-    event output_leave(output: object);
-    event state(state: array);
-    event done();
-    event closed();
-    event parent(parent: object) since 3;
-}
-
-crate::wl_protocol! {
-    interface zwp_relative_pointer_manager_v1, version = 1;
-    request destroy();
-    request get_relative_pointer(id: new_id, pointer: object);
-}
-
-crate::wl_protocol! {
-    interface zwp_relative_pointer_v1, version = 1;
-    request destroy();
-    event relative_motion(utime_hi: uint, utime_lo: uint, dx: fixed, dy: fixed, dx_unaccel: fixed, dy_unaccel: fixed);
-}
-
-crate::wl_protocol! {
-    interface zwp_pointer_constraints_v1, version = 1;
-    request destroy();
-    request lock_pointer(id: new_id, surface: object, pointer: object, region: object, lifetime: uint);
-    request confine_pointer(id: new_id, surface: object, pointer: object, region: object, lifetime: uint);
-}
-
-crate::wl_protocol! {
-    interface zwp_locked_pointer_v1, version = 1;
-    request destroy();
-    request set_cursor_position_hint(surface_x: fixed, surface_y: fixed);
-    request set_region(region: object);
-    event locked();
-    event unlocked();
-}
-
-crate::wl_protocol! {
-    interface zwp_confined_pointer_v1, version = 1;
-    request destroy();
-    request set_region(region: object);
-    event confined();
-    event unconfined();
-}
-
-crate::wl_protocol! {
-    interface wp_tearing_control_manager_v1, version = 1;
-    request destroy();
-    request get_tearing_control(id: new_id, surface: object);
-}
-
-crate::wl_protocol! {
-    interface wp_tearing_control_v1, version = 1;
-    request set_presentation_hint(hint: uint);
-    request destroy();
 }
 
 // wl_display.error codes
@@ -733,6 +733,96 @@ mod tests {
         assert_eq!(zwp_primary_selection_device_v1::selection::OPCODE, 1);
         assert_eq!(zwp_primary_selection_offer_v1::receive::OPCODE, 0);
         assert_eq!(zwp_primary_selection_offer_v1::offer::OPCODE, 0);
+        assert_eq!(zwlr_screencopy_manager_v1::capture_output_region::OPCODE, 1);
+        assert_eq!(zwlr_screencopy_frame_v1::copy::OPCODE, 0);
+        assert_eq!(zwlr_screencopy_frame_v1::copy_with_damage::OPCODE, 2);
+        assert_eq!(zwlr_screencopy_frame_v1::buffer::OPCODE, 0);
+        assert_eq!(zwlr_screencopy_frame_v1::ready::OPCODE, 2);
+        assert_eq!(zwlr_screencopy_frame_v1::damage::OPCODE, 4);
+        assert_eq!(zwlr_screencopy_frame_v1::linux_dmabuf::OPCODE, 5);
+        assert_eq!(zwlr_screencopy_frame_v1::buffer_done::OPCODE, 6);
+        assert_eq!(zwlr_foreign_toplevel_manager_v1::stop::OPCODE, 0);
+        assert_eq!(zwlr_foreign_toplevel_manager_v1::toplevel::OPCODE, 0);
+        assert_eq!(zwlr_foreign_toplevel_manager_v1::finished::OPCODE, 1);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::activate::OPCODE, 4);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::close::OPCODE, 5);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::destroy::OPCODE, 7);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::set_fullscreen::OPCODE, 8);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::title::OPCODE, 0);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::state::OPCODE, 4);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::done::OPCODE, 5);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::closed::OPCODE, 6);
+        assert_eq!(zwlr_foreign_toplevel_handle_v1::parent::OPCODE, 7);
+        assert_eq!(zwlr_screencopy_frame_v1::failed::OPCODE, 3);
+        assert_eq!(ext_foreign_toplevel_list_v1::stop::OPCODE, 0);
+        assert_eq!(ext_foreign_toplevel_list_v1::destroy::OPCODE, 1);
+        assert_eq!(ext_foreign_toplevel_list_v1::toplevel::OPCODE, 0);
+        assert_eq!(ext_foreign_toplevel_list_v1::finished::OPCODE, 1);
+        assert_eq!(ext_foreign_toplevel_handle_v1::destroy::OPCODE, 0);
+        assert_eq!(ext_foreign_toplevel_handle_v1::closed::OPCODE, 0);
+        assert_eq!(ext_foreign_toplevel_handle_v1::done::OPCODE, 1);
+        assert_eq!(ext_foreign_toplevel_handle_v1::title::OPCODE, 2);
+        assert_eq!(ext_foreign_toplevel_handle_v1::app_id::OPCODE, 3);
+        assert_eq!(ext_foreign_toplevel_handle_v1::identifier::OPCODE, 4);
+        assert_eq!(ext_image_capture_source_v1::destroy::OPCODE, 0);
+        assert_eq!(ext_output_image_capture_source_manager_v1::create_source::OPCODE, 0);
+        assert_eq!(ext_output_image_capture_source_manager_v1::destroy::OPCODE, 1);
+        assert_eq!(ext_foreign_toplevel_image_capture_source_manager_v1::create_source::OPCODE, 0);
+        assert_eq!(ext_foreign_toplevel_image_capture_source_manager_v1::destroy::OPCODE, 1);
+        assert_eq!(ext_image_copy_capture_manager_v1::create_session::OPCODE, 0);
+        assert_eq!(ext_image_copy_capture_manager_v1::create_pointer_cursor_session::OPCODE, 1);
+        assert_eq!(ext_image_copy_capture_manager_v1::destroy::OPCODE, 2);
+        assert_eq!(ext_image_copy_capture_session_v1::create_frame::OPCODE, 0);
+        assert_eq!(ext_image_copy_capture_session_v1::destroy::OPCODE, 1);
+        assert_eq!(ext_image_copy_capture_session_v1::buffer_size::OPCODE, 0);
+        assert_eq!(ext_image_copy_capture_session_v1::shm_format::OPCODE, 1);
+        assert_eq!(ext_image_copy_capture_session_v1::dmabuf_device::OPCODE, 2);
+        assert_eq!(ext_image_copy_capture_session_v1::dmabuf_format::OPCODE, 3);
+        assert_eq!(ext_image_copy_capture_session_v1::done::OPCODE, 4);
+        assert_eq!(ext_image_copy_capture_session_v1::stopped::OPCODE, 5);
+        assert_eq!(ext_image_copy_capture_frame_v1::destroy::OPCODE, 0);
+        assert_eq!(ext_image_copy_capture_frame_v1::attach_buffer::OPCODE, 1);
+        assert_eq!(ext_image_copy_capture_frame_v1::damage_buffer::OPCODE, 2);
+        assert_eq!(ext_image_copy_capture_frame_v1::capture::OPCODE, 3);
+        assert_eq!(ext_image_copy_capture_frame_v1::transform::OPCODE, 0);
+        assert_eq!(ext_image_copy_capture_frame_v1::damage::OPCODE, 1);
+        assert_eq!(ext_image_copy_capture_frame_v1::presentation_time::OPCODE, 2);
+        assert_eq!(ext_image_copy_capture_frame_v1::ready::OPCODE, 3);
+        assert_eq!(ext_image_copy_capture_frame_v1::failed::OPCODE, 4);
+        assert_eq!(ext_image_copy_capture_cursor_session_v1::destroy::OPCODE, 0);
+        assert_eq!(ext_image_copy_capture_cursor_session_v1::get_capture_session::OPCODE, 1);
+        assert_eq!(ext_image_copy_capture_cursor_session_v1::enter::OPCODE, 0);
+        assert_eq!(ext_image_copy_capture_cursor_session_v1::leave::OPCODE, 1);
+        assert_eq!(ext_image_copy_capture_cursor_session_v1::position::OPCODE, 2);
+        assert_eq!(ext_image_copy_capture_cursor_session_v1::hotspot::OPCODE, 3);
+        assert_eq!(zwp_linux_dmabuf_v1::create_params::OPCODE, 1);
+        assert_eq!(zwp_linux_dmabuf_v1::get_default_feedback::OPCODE, 2);
+        assert_eq!(zwp_linux_dmabuf_v1::get_surface_feedback::OPCODE, 3);
+        assert_eq!(zwp_linux_dmabuf_v1::modifier::OPCODE, 1);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::format_table::OPCODE, 1);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::main_device::OPCODE, 2);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_done::OPCODE, 3);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_formats::OPCODE, 5);
+        assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_flags::OPCODE, 6);
+        assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
+        assert_eq!(zwp_linux_buffer_params_v1::create::OPCODE, 2);
+        assert_eq!(zwp_linux_buffer_params_v1::create_immed::OPCODE, 3);
+        assert_eq!(zwp_linux_buffer_params_v1::created::OPCODE, 0);
+        assert_eq!(zwp_linux_buffer_params_v1::failed::OPCODE, 1);
+        assert_eq!(zwp_relative_pointer_manager_v1::get_relative_pointer::OPCODE, 1);
+        assert_eq!(zwp_relative_pointer_v1::relative_motion::OPCODE, 0);
+        assert_eq!(zwp_pointer_constraints_v1::lock_pointer::OPCODE, 1);
+        assert_eq!(zwp_pointer_constraints_v1::confine_pointer::OPCODE, 2);
+        assert_eq!(zwp_locked_pointer_v1::set_cursor_position_hint::OPCODE, 1);
+        assert_eq!(zwp_locked_pointer_v1::set_region::OPCODE, 2);
+        assert_eq!(zwp_locked_pointer_v1::locked::OPCODE, 0);
+        assert_eq!(zwp_locked_pointer_v1::unlocked::OPCODE, 1);
+        assert_eq!(zwp_confined_pointer_v1::set_region::OPCODE, 1);
+        assert_eq!(zwp_confined_pointer_v1::confined::OPCODE, 0);
+        assert_eq!(zwp_confined_pointer_v1::unconfined::OPCODE, 1);
+        assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
+        assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
+        assert_eq!(wp_tearing_control_v1::destroy::OPCODE, 1);
         assert_eq!(xwayland_shell_v1::get_xwayland_surface::OPCODE, 1);
         assert_eq!(xwayland_surface_v1::set_serial::OPCODE, 0);
         assert_eq!(xwayland_surface_v1::destroy::OPCODE, 1);
@@ -766,36 +856,6 @@ mod tests {
         assert_eq!(wl_output::scale::OPCODE, 3);
         assert_eq!(wl_output::name::OPCODE, 4);
         assert_eq!(wl_output::description::OPCODE, 5);
-        assert_eq!(zwp_linux_dmabuf_v1::create_params::OPCODE, 1);
-        assert_eq!(zwp_linux_dmabuf_v1::get_default_feedback::OPCODE, 2);
-        assert_eq!(zwp_linux_dmabuf_v1::get_surface_feedback::OPCODE, 3);
-        assert_eq!(zwp_linux_dmabuf_v1::modifier::OPCODE, 1);
-        assert_eq!(zwp_linux_dmabuf_feedback_v1::format_table::OPCODE, 1);
-        assert_eq!(zwp_linux_dmabuf_feedback_v1::main_device::OPCODE, 2);
-        assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_done::OPCODE, 3);
-        assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_formats::OPCODE, 5);
-        assert_eq!(zwp_linux_dmabuf_feedback_v1::tranche_flags::OPCODE, 6);
-        assert_eq!(zwp_linux_buffer_params_v1::add::OPCODE, 1);
-        assert_eq!(wp_tearing_control_manager_v1::get_tearing_control::OPCODE, 1);
-        assert_eq!(wp_tearing_control_v1::set_presentation_hint::OPCODE, 0);
-        assert_eq!(ext_idle_notifier_v1::get_idle_notification::OPCODE, 1);
-        assert_eq!(ext_idle_notification_v1::resumed::OPCODE, 1);
-        assert_eq!(zwp_idle_inhibit_manager_v1::create_inhibitor::OPCODE, 1);
-        assert_eq!(zwlr_screencopy_frame_v1::copy_with_damage::OPCODE, 2);
-        assert_eq!(zwlr_screencopy_frame_v1::buffer_done::OPCODE, 6);
-        assert_eq!(ext_foreign_toplevel_handle_v1::identifier::OPCODE, 4);
-        assert_eq!(ext_image_copy_capture_manager_v1::create_session::OPCODE, 0);
-        assert_eq!(ext_image_copy_capture_frame_v1::capture::OPCODE, 3);
-        assert_eq!(zwlr_foreign_toplevel_handle_v1::activate::OPCODE, 4);
-        assert_eq!(zwlr_foreign_toplevel_handle_v1::close::OPCODE, 5);
-        assert_eq!(zwlr_foreign_toplevel_handle_v1::closed::OPCODE, 6);
-        assert_eq!(zwlr_data_control_device_v1::set_primary_selection::OPCODE, 2);
-        assert_eq!(zwlr_data_control_device_v1::primary_selection::OPCODE, 3);
-        assert_eq!(zwlr_data_control_offer_v1::receive::OPCODE, 0);
-        assert_eq!(zwp_relative_pointer_v1::relative_motion::OPCODE, 0);
-        assert_eq!(zwp_pointer_constraints_v1::lock_pointer::OPCODE, 1);
-        assert_eq!(zwp_pointer_constraints_v1::confine_pointer::OPCODE, 2);
-        assert_eq!(zwp_locked_pointer_v1::set_cursor_position_hint::OPCODE, 1);
     }
 
     /// byte-exact fixtures pin arg offsets and padding, not just opcodes
