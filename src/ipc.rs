@@ -143,6 +143,7 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
         Ok("windows") => Ok(windows_json(state)),
         Ok("clients") => Ok(clients_json(state)),
         Ok("reload") => reload(state).map(|_| json!(true)),
+        Ok("dump-shadow") => dump_shadow(state),
         Ok("dpms-off") => {
             crate::output::dpms(state, false);
             Ok(json!(true))
@@ -244,6 +245,30 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
 }
 
 // -- queries --
+
+// forensics: the focused window's commit-time shm shadow as a ppm.
+// blank regions here mean the client committed blank pixels; full
+// content here with a blank screen means the upload/quad path lies
+fn dump_shadow(state: &Rc<State>) -> Result<Value, String> {
+    let win = crate::tree::focused_window(state).ok_or("no focused window")?;
+    let s = win.surface();
+    let shadow = s.shm_shadow.borrow();
+    let px = shadow.as_ref().ok_or("no shm shadow (dmabuf client?)")?;
+    let buf = s.buffer.borrow();
+    let b = &buf.as_ref().ok_or("no buffer attached")?.buf;
+    let (w, h) = (b.rect.width() as usize, b.rect.height() as usize);
+    if px.len() < w * h * 4 {
+        return Err(format!("shadow {} short of {}x{}", px.len(), w, h));
+    }
+    let path = format!("/tmp/carrot-shadow-{}.ppm", s.uid);
+    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+    for p in px[..w * h * 4].chunks_exact(4) {
+        // shm is little-endian [a]rgb; ppm wants rgb
+        out.extend_from_slice(&[p[2], p[1], p[0]]);
+    }
+    std::fs::write(&path, out).map_err(|e| format!("write {path}: {e}"))?;
+    Ok(json!({ "path": path, "w": w, "h": h, "gen": s.content_gen.get() }))
+}
 
 fn monitors_json(state: &Rc<State>) -> Value {
     let focused = state.focused_output.get();
