@@ -1203,7 +1203,7 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
         let slot = ls.output.get();
         let survivor = old.get(slot).and_then(|o| outs.iter().position(|n| Rc::ptr_eq(n, o)));
         let Some(new) = survivor else {
-            ls.send_closed();
+            ls.close_for_output_loss(state, old.get(slot).map(|o| o.conn.name.as_str()));
             continue;
         };
         ls.output.set(new);
@@ -1726,7 +1726,8 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     };
 
     // paint order: background, bottom, tiled, fullscreen, floats, top,
-    // overlay; fullscreen hides everything below itself except overlay
+    // overlay, layer popups; fullscreen hides everything below itself
+    // except overlay
     if fs.is_none() {
         draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live);
         draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live);
@@ -1744,6 +1745,7 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
         draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live);
     }
     draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live);
+    draw_layer_popups(state, out, fs.is_some(), screen, &mut ops, &mut live);
     // a drag icon rides the pointer, above everything but the cursor
     if let Some(seat) = state.seat.borrow().clone() {
         if let Some(drag) = seat.data.drag() {
@@ -1845,7 +1847,7 @@ fn draw_popups(
     xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, ops, live));
 }
 
-// one shell layer, mapping order = z within it, popups on top of each
+// one shell layer, mapping order = z within it
 fn draw_layer(
     state: &Rc<State>,
     out: &Rc<Output>,
@@ -1864,6 +1866,29 @@ fn draw_layer(
         }
         let r = ls.rect.get();
         draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, ops, live);
+    }
+}
+
+// layer-parented popups form one band above every layer; a popup of a
+// layer hidden by fullscreen hides with its parent
+fn draw_layer_popups(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    fs_active: bool,
+    screen: Rect,
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<(ClientId, u64)>,
+) {
+    let layers = state.layers.borrow().clone();
+    for ls in layers.iter() {
+        if !ls.mapped() || ls.output.get() != out.index.get() {
+            continue;
+        }
+        if fs_active && ls.current.get().layer != crate::shell::layer::OVERLAY {
+            continue;
+        }
+        let r = ls.rect.get();
+        ls.for_each_popup(|p| draw_popup(state, out, p, r.x1, r.y1, screen, ops, live));
     }
 }
 

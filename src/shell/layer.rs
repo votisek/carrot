@@ -35,6 +35,7 @@ pub const KI_ON_DEMAND: u32 = 2;
 // zwlr_layer_shell_v1 errors
 const ROLE: u32 = 0;
 const INVALID_LAYER: u32 = 1;
+const ALREADY_CONSTRUCTED: u32 = 2;
 // zwlr_layer_surface_v1 errors
 const INVALID_SURFACE_STATE: u32 = 0;
 const INVALID_SIZE: u32 = 1;
@@ -96,8 +97,14 @@ impl zwlr_layer_shell_v1::Handler for LayerShell {
             );
             return Ok(());
         }
-        if surface.buffer.borrow().is_some() {
-            c.protocol_error(self.id, ROLE, "the surface already has a committed buffer");
+        let has_buffer = surface.buffer.borrow().is_some()
+            || matches!(&surface.pending.borrow().buffer, Some(Some(_)));
+        if has_buffer {
+            c.protocol_error(
+                self.id,
+                ALREADY_CONSTRUCTED,
+                "the surface already has a buffer attached or committed",
+            );
             return Ok(());
         }
         // a named output pins the layer there; null means the focused one
@@ -122,6 +129,7 @@ impl zwlr_layer_shell_v1::Handler for LayerShell {
             surface: surface.clone(),
             pending: Cell::new(LayerState::new(req.layer)),
             current: Cell::new(LayerState::new(req.layer)),
+            created_layer: req.layer,
             next_serial: Cell::new(1),
             last_sent: Cell::new(0),
             acked: Cell::new(0),
@@ -247,6 +255,8 @@ pub struct LayerSurface {
     pub surface: Rc<WlSurface>,
     pending: Cell<LayerState>,
     pub current: Cell<LayerState>,
+    /// the get_layer_surface layer argument; unmap resets back to it
+    created_layer: u32,
     next_serial: Cell<u32>,
     last_sent: Cell<u32>,
     acked: Cell<u32>,
@@ -311,6 +321,12 @@ impl LayerSurface {
         }
     }
 
+    pub fn for_each_popup_rev(&self, mut f: impl FnMut(&Rc<super::xdg::XdgPopup>)) {
+        for p in self.popups.borrow().iter().rev() {
+            f(p);
+        }
+    }
+
     pub fn unlink_popup(&self, id: ObjectId) {
         self.popups.borrow_mut().retain(|p| p.id != id);
     }
@@ -318,7 +334,7 @@ impl LayerSurface {
     // spec: unmapping resets everything to post-create defaults and the
     // whole configure cycle runs again on remap
     fn reset_after_unmap(&self) {
-        let layer = self.current.get().layer;
+        let layer = self.created_layer;
         self.pending.set(LayerState::new(layer));
         self.current.set(LayerState::new(layer));
         self.configured.set(false);
@@ -341,6 +357,21 @@ impl LayerSurface {
             }
             state.damage.trigger();
         }
+    }
+
+    /// the output the surface is pinned to is gone: it will no longer be
+    /// shown - leave the output, send closed, ignore it until destroy
+    pub fn close_for_output_loss(&self, state: &Rc<State>, dead: Option<&str>) {
+        if self.linked.get() && !self.surface.destroyed.get() {
+            if let Some(name) = dead {
+                crate::tree::send_surface_output_named(&self.surface, name, false);
+            }
+        }
+        self.send_closed();
+        for p in self.popups.borrow().iter() {
+            p.send_done();
+        }
+        self.unlink(state);
     }
 }
 
@@ -409,6 +440,11 @@ impl zwlr_layer_surface_v1::Handler for LayerSurface {
             self.client.invalid_object(req.popup);
             return Ok(());
         };
+        // spec: the popup must have been created with a NULL parent
+        if popup.has_parent() {
+            self.client.implementation_error("the popup already has a parent");
+            return Ok(());
+        }
         popup.set_layer_parent(&self.rc());
         self.popups.borrow_mut().push(popup);
         Ok(())
@@ -832,6 +868,26 @@ mod tests {
         s.commit(wl_surface::commit::Request {}).unwrap();
     }
 
+    // the configure/ack/attach/commit cycle once the state is staged
+    fn map_cycle(
+        state: &Rc<State>,
+        client: &Rc<Client>,
+        s: &Rc<WlSurface>,
+        ls: &Rc<LayerSurface>,
+        buf: u32,
+    ) {
+        commit(s);
+        crate::shell::xdg::flush_configures(state);
+        ls.ack_configure(zwlr_layer_surface_v1::ack_configure::Request {
+            serial: ls.last_sent.get(),
+        })
+        .unwrap();
+        let b = test_buffer(client, ObjectId(buf), 64, 64);
+        s.attach(wl_surface::attach::Request { buffer: b.id, x: 0, y: 0 })
+            .unwrap();
+        commit(s);
+    }
+
     // anchor + size + zone, then the whole configure/ack/map cycle
     fn map_bar(
         state: &Rc<State>,
@@ -848,16 +904,24 @@ mod tests {
             .unwrap();
         ls.set_exclusive_zone(zwlr_layer_surface_v1::set_exclusive_zone::Request { zone })
             .unwrap();
-        commit(s);
-        crate::shell::xdg::flush_configures(state);
-        ls.ack_configure(zwlr_layer_surface_v1::ack_configure::Request {
-            serial: ls.last_sent.get(),
-        })
-        .unwrap();
-        let b = test_buffer(client, ObjectId(buf), 64, 64);
-        s.attach(wl_surface::attach::Request { buffer: b.id, x: 0, y: 0 })
-            .unwrap();
-        commit(s);
+        map_cycle(state, client, s, ls, buf);
+    }
+
+    // (cited object, code) from the first wl_display.error on the wire
+    fn first_error(bytes: &[u8]) -> Option<(u32, u32)> {
+        let mut off = 0;
+        while off + 8 <= bytes.len() {
+            let obj = u32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
+            let w2 = u32::from_ne_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            let len = ((w2 >> 16) as usize).max(8);
+            if obj == ERR.0 && w2 & 0xffff == 0 && off + 16 <= bytes.len() {
+                let cited = u32::from_ne_bytes(bytes[off + 8..off + 12].try_into().unwrap());
+                let code = u32::from_ne_bytes(bytes[off + 12..off + 16].try_into().unwrap());
+                return Some((cited, code));
+            }
+            off += len;
+        }
+        None
     }
 
     #[test]
@@ -953,5 +1017,209 @@ mod tests {
         commit(&s);
         assert!(kb_lock(&state).is_none());
         assert!(seat.kb_focus.borrow().is_none());
+    }
+
+    #[test]
+    fn output_loss_closes_the_bar_and_returns_its_zone() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (s, ls) = mk_layer(&client, 10, 20, TOP);
+        map_bar(&state, &client, &s, &ls, 30, 30, 40);
+        assert_eq!(state.usable.get(), Rect { x1: 0, y1: 30, x2: 800, y2: 600 });
+        ls.close_for_output_loss(&state, None);
+        ls.close_for_output_loss(&state, None);
+        // closed once despite the double call
+        assert_eq!(count_events(&client.queued_out_bytes(), ls.id, 1), 1);
+        assert!(!ls.mapped());
+        assert!(state.layers.borrow().is_empty());
+        assert_eq!(state.usable.get(), Rect { x1: 0, y1: 0, x2: 800, y2: 600 });
+    }
+
+    #[test]
+    fn a_closed_surface_ignores_commits_until_destroyed() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (s, ls) = mk_layer(&client, 10, 20, TOP);
+        map_bar(&state, &client, &s, &ls, 30, 30, 40);
+        ls.close_for_output_loss(&state, None);
+        let configures = count_events(&client.queued_out_bytes(), ls.id, 0);
+        // further changes are ignored, never errored on
+        let b = test_buffer(&client, ObjectId(41), 64, 64);
+        s.attach(wl_surface::attach::Request { buffer: b.id, x: 0, y: 0 })
+            .unwrap();
+        commit(&s);
+        crate::shell::xdg::flush_configures(&state);
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 0);
+        assert!(!ls.mapped());
+        assert!(state.layers.borrow().is_empty());
+        assert_eq!(count_events(&client.queued_out_bytes(), ls.id, 0), configures);
+        // the client answers closed with destroy
+        ls.destroy(zwlr_layer_surface_v1::destroy::Request {}).unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 0);
+    }
+
+    #[test]
+    fn output_loss_repicks_pointer_focus_from_under_the_dead_bar() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = crate::input::seat::SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        seat.warp(&state, 30.0, 10.0);
+        let (s, ls) = mk_layer(&client, 10, 20, TOP);
+        map_bar(&state, &client, &s, &ls, 30, 30, 40);
+        assert!(seat.pointer_focus().is_some_and(|f| Rc::ptr_eq(&f, &s)));
+        ls.close_for_output_loss(&state, None);
+        assert!(seat.pointer_focus().is_none());
+    }
+
+    #[test]
+    fn perpendicular_exclusive_zones_agree_with_placement() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        // a left dock claims 40px of the edge
+        let (s1, dock) = mk_layer(&client, 10, 20, TOP);
+        dock.set_anchor(zwlr_layer_surface_v1::set_anchor::Request { anchor: 1 | 2 | 4 })
+            .unwrap();
+        dock.set_size(zwlr_layer_surface_v1::set_size::Request { width: 40, height: 0 })
+            .unwrap();
+        dock.set_exclusive_zone(zwlr_layer_surface_v1::set_exclusive_zone::Request { zone: 40 })
+            .unwrap();
+        map_cycle(&state, &client, &s1, &dock, 40);
+        assert_eq!(dock.rect.get(), Rect { x1: 0, y1: 0, x2: 40, y2: 600 });
+        // a top bar arranges inside what the dock left over, and its
+        // configure carries that same width
+        let (s2, bar) = mk_layer(&client, 11, 21, TOP);
+        map_bar(&state, &client, &s2, &bar, 30, 30, 41);
+        assert_eq!(bar.rect.get(), Rect { x1: 40, y1: 0, x2: 800, y2: 30 });
+        assert_eq!(bar.last_cfg.get(), Some((760, 30)));
+        assert_eq!(state.usable.get(), Rect { x1: 40, y1: 30, x2: 800, y2: 600 });
+    }
+
+    #[test]
+    fn positive_zone_without_a_single_edge_is_treated_as_zero() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (s1, dock) = mk_layer(&client, 10, 20, TOP);
+        dock.set_anchor(zwlr_layer_surface_v1::set_anchor::Request { anchor: 1 | 2 | 4 })
+            .unwrap();
+        dock.set_size(zwlr_layer_surface_v1::set_size::Request { width: 40, height: 0 })
+            .unwrap();
+        dock.set_exclusive_zone(zwlr_layer_surface_v1::set_exclusive_zone::Request { zone: 40 })
+            .unwrap();
+        map_cycle(&state, &client, &s1, &dock, 40);
+        // corner-anchored with a positive zone: placed inside the usable
+        // area and reserving nothing
+        let (s2, corner) = mk_layer(&client, 11, 21, TOP);
+        corner
+            .set_anchor(zwlr_layer_surface_v1::set_anchor::Request { anchor: 1 | 4 })
+            .unwrap();
+        corner
+            .set_size(zwlr_layer_surface_v1::set_size::Request { width: 100, height: 100 })
+            .unwrap();
+        corner
+            .set_exclusive_zone(zwlr_layer_surface_v1::set_exclusive_zone::Request { zone: 10 })
+            .unwrap();
+        map_cycle(&state, &client, &s2, &corner, 41);
+        assert_eq!(corner.rect.get(), Rect { x1: 40, y1: 0, x2: 140, y2: 100 });
+        assert_eq!(state.usable.get(), Rect { x1: 40, y1: 0, x2: 800, y2: 600 });
+    }
+
+    #[test]
+    fn unmap_restores_the_creation_layer() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (s, ls) = mk_layer(&client, 10, 20, TOP);
+        map_bar(&state, &client, &s, &ls, 30, 30, 40);
+        ls.set_layer(zwlr_layer_surface_v1::set_layer::Request { layer: BACKGROUND })
+            .unwrap();
+        commit(&s);
+        assert_eq!(ls.current.get().layer, BACKGROUND);
+        s.attach(wl_surface::attach::Request { buffer: ObjectId::NONE, x: 0, y: 0 })
+            .unwrap();
+        commit(&s);
+        assert!(!ls.mapped());
+        assert_eq!(ls.current.get().layer, TOP);
+    }
+
+    #[test]
+    fn a_committed_buffer_gets_already_constructed() {
+        let (_state, client) = test_client();
+        let s = WlSurface::new(ObjectId(10), &client, 6);
+        client.add_client_obj(s.clone()).unwrap();
+        client.objects.track_surface(s.clone());
+        let b = test_buffer(&client, ObjectId(40), 64, 64);
+        s.attach(wl_surface::attach::Request { buffer: b.id, x: 0, y: 0 })
+            .unwrap();
+        commit(&s);
+        let shell = Rc::new(LayerShell {
+            id: ObjectId(90),
+            client: client.clone(),
+            version: 5,
+        });
+        shell
+            .get_layer_surface(zwlr_layer_shell_v1::get_layer_surface::Request {
+                id: ObjectId(20),
+                surface: ObjectId(10),
+                output: ObjectId::NONE,
+                layer: TOP,
+                namespace: "test".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            first_error(&client.queued_out_bytes()),
+            Some((90, ALREADY_CONSTRUCTED))
+        );
+    }
+
+    #[test]
+    fn a_pending_attach_gets_already_constructed() {
+        let (_state, client) = test_client();
+        let s = WlSurface::new(ObjectId(10), &client, 6);
+        client.add_client_obj(s.clone()).unwrap();
+        client.objects.track_surface(s.clone());
+        // attached but never committed still counts
+        let b = test_buffer(&client, ObjectId(40), 64, 64);
+        s.attach(wl_surface::attach::Request { buffer: b.id, x: 0, y: 0 })
+            .unwrap();
+        let shell = Rc::new(LayerShell {
+            id: ObjectId(90),
+            client: client.clone(),
+            version: 5,
+        });
+        shell
+            .get_layer_surface(zwlr_layer_shell_v1::get_layer_surface::Request {
+                id: ObjectId(20),
+                surface: ObjectId(10),
+                output: ObjectId::NONE,
+                layer: TOP,
+                namespace: "test".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            first_error(&client.queued_out_bytes()),
+            Some((90, ALREADY_CONSTRUCTED))
+        );
+    }
+
+    #[test]
+    fn negative_margins_overhang_the_output() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (s, ls) = mk_layer(&client, 10, 20, TOP);
+        ls.set_anchor(zwlr_layer_surface_v1::set_anchor::Request { anchor: 1 | 4 | 8 })
+            .unwrap();
+        ls.set_size(zwlr_layer_surface_v1::set_size::Request { width: 0, height: 30 })
+            .unwrap();
+        ls.set_margin(zwlr_layer_surface_v1::set_margin::Request {
+            top: 0,
+            right: -50,
+            bottom: 0,
+            left: -50,
+        })
+        .unwrap();
+        map_cycle(&state, &client, &s, &ls, 40);
+        // the layout keeps the overhang; drawing clips it to the output
+        assert_eq!(ls.rect.get(), Rect { x1: -50, y1: 0, x2: 850, y2: 30 });
+        assert_eq!(ls.last_cfg.get(), Some((900, 30)));
     }
 }

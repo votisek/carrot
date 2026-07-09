@@ -563,6 +563,13 @@ impl XdgSurface {
             f(p);
         }
     }
+
+    /// siblings in reverse: a new popup stacks above all previously created ones
+    pub fn for_each_popup_rev(&self, mut f: impl FnMut(&Rc<XdgPopup>)) {
+        for p in self.popups.borrow().iter().rev() {
+            f(p);
+        }
+    }
 }
 
 impl xdg_surface::Handler for XdgSurface {
@@ -1107,7 +1114,7 @@ impl Object for XdgToplevel {
 // -- xdg_popup --
 
 // a popup's parent is another xdg surface, or - via layer get_popup - a
-// layer surface; quickshell reparents null-parent popups that way
+// layer surface that adopts a popup created with a null parent
 #[derive(Clone)]
 pub enum PopupParent {
     Xdg(Rc<XdgSurface>),
@@ -1124,9 +1131,34 @@ impl PopupParent {
             }
         }
     }
+
+    /// what the positioner constrains against: the parent's output stands
+    /// in for the compositor work area; the union extent headless
+    fn constraint_bounds(&self, state: &Rc<State>) -> Rect {
+        match self {
+            PopupParent::Layer(l) => crate::shell::layer::slot_rect(state, l.output.get()),
+            PopupParent::Xdg(x) => {
+                if let Some(tl) = x.toplevel() {
+                    let win = tl.window.borrow().clone();
+                    if let Some(win) = win {
+                        if let Some(ws) = crate::tree::workspace_of(state, &win) {
+                            return crate::tree::workspace_output_rect(state, &ws);
+                        }
+                    }
+                } else if let Some(p) = x.popup() {
+                    let parent = p.parent.borrow().clone();
+                    if let Some(parent) = parent {
+                        return parent.constraint_bounds(state);
+                    }
+                }
+                let (w, h) = crate::tree::output_extent(state);
+                Rect::new_sized_saturating(0, 0, w.max(1), h.max(1))
+            }
+        }
+    }
 }
 
-/// popups render above their parent at the positioner's spot; grabs and constraint solving TODO.
+/// renders above its parent at the positioner's chosen spot
 pub struct XdgPopup {
     pub id: ObjectId,
     pub client: Rc<Client>,
@@ -1158,6 +1190,10 @@ impl XdgPopup {
         *self.parent.borrow_mut() = Some(PopupParent::Layer(ls.clone()));
     }
 
+    pub fn has_parent(&self) -> bool {
+        self.parent.borrow().is_some()
+    }
+
     /// absolute origin of the parent's geometry, walking nested popups
     /// down to the toplevel's window rect or the layer surface's slot
     fn parent_origin(&self) -> Option<(i32, i32)> {
@@ -1166,11 +1202,14 @@ impl XdgPopup {
     }
 
     fn solve_position(&self) {
-        let Some(org) = self.parent_origin() else {
+        let parent = self.parent.borrow().clone();
+        let Some(parent) = parent else {
             return;
         };
-        let (w, h) = crate::tree::output_extent(&self.client.state);
-        let bounds = Rect::new_sized_saturating(0, 0, w.max(1), h.max(1));
+        let Some(org) = parent.abs_origin() else {
+            return;
+        };
+        let bounds = parent.constraint_bounds(&self.client.state);
         let (rel, size) = self.positioned.get().solve(org, bounds);
         self.rel.set(rel);
         self.size.set(size);
@@ -1764,6 +1803,29 @@ mod tests {
     }
 
     #[test]
+    fn constraints_respect_offset_bounds() {
+        // anchored to the parent's left edge, extending left - crosses the
+        // left edge of a box that does not start at the global origin
+        let p = Positioned {
+            size: (100, 50),
+            anchor_rect: Rect { x1: 0, y1: 0, x2: 10, y2: 10 },
+            anchor: 3,
+            gravity: 3,
+            offset: (0, 0),
+            ca: 4, // flip_x
+        };
+        let bounds = Rect { x1: 800, y1: 0, x2: 1600, y2: 600 };
+        // parent at x=850: unflipped the popup starts at 750, left of the box
+        let ((rx, _), (w, _)) = p.solve((850, 0), bounds);
+        // flipped to the anchor rect's right edge, extending right
+        assert_eq!((rx, w), (10, 100));
+        // same overflow with slide_x: clamped to the box's left edge, not 0
+        let p = Positioned { ca: 1, ..p };
+        let ((rx, _), _) = p.solve((850, 0), bounds);
+        assert_eq!(rx + 850, 800);
+    }
+
+    #[test]
     fn popup_grab_holds_and_returns_the_keyboard() {
         let (state, client) = test_client();
         state.output_size.set((800, 600));
@@ -1819,6 +1881,356 @@ mod tests {
         assert_eq!(count_events(&client.queued_out_bytes(), popup.id, 1), 1);
         assert!(seat.kb_focus.borrow().as_ref().is_some_and(|s| Rc::ptr_eq(s, &s1)));
         assert!(seat.popup_grab.borrow().is_empty());
+    }
+
+    /// popup at parent-relative (10,10): anchor rect (0,0,10,10), anchor
+    /// and gravity both bottom-right
+    fn mk_popup(
+        client: &Rc<Client>,
+        base: &Rc<XdgWmBase>,
+        sid: u32,
+        xid: u32,
+        pid: u32,
+        popid: u32,
+        parent: ObjectId,
+    ) -> (Rc<WlSurface>, Rc<XdgSurface>, Rc<XdgPopup>) {
+        let s = WlSurface::new(ObjectId(sid), client, 6);
+        client.add_client_obj(s.clone()).unwrap();
+        client.objects.track_surface(s.clone());
+        base.get_xdg_surface(xdg_wm_base::get_xdg_surface::Request {
+            id: ObjectId(xid),
+            surface: ObjectId(sid),
+        })
+        .unwrap();
+        let xdg = base.surfaces.borrow().get(&ObjectId(xid)).cloned().unwrap();
+        base.create_positioner(xdg_wm_base::create_positioner::Request { id: ObjectId(pid) })
+            .unwrap();
+        {
+            let pos = client.objects.positioner(ObjectId(pid)).unwrap();
+            use xdg_positioner::Handler as _;
+            pos.set_size(xdg_positioner::set_size::Request { width: 50, height: 30 })
+                .unwrap();
+            pos.set_anchor_rect(xdg_positioner::set_anchor_rect::Request {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            })
+            .unwrap();
+            pos.set_anchor(xdg_positioner::set_anchor::Request { anchor: 8 }).unwrap();
+            pos.set_gravity(xdg_positioner::set_gravity::Request { gravity: 8 }).unwrap();
+        }
+        xdg.get_popup(xdg_surface::get_popup::Request {
+            id: ObjectId(popid),
+            parent,
+            positioner: ObjectId(pid),
+        })
+        .unwrap();
+        let popup = xdg.popup().unwrap();
+        (s, xdg, popup)
+    }
+
+    #[test]
+    fn overlapping_sibling_popups_hit_newest_first() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let base = mk_base(&client, 30);
+        let (s1, x1, t1) = mk_toplevel(&client, &base, 10, 40, 50);
+        map(&state, &client, &s1, &x1, 20);
+        let (ps1, px1, p1) = mk_popup(&client, &base, 11, 41, 45, 51, ObjectId(40));
+        map(&state, &client, &ps1, &px1, 21);
+        let (ps2, px2, p2) = mk_popup(&client, &base, 12, 42, 46, 52, ObjectId(40));
+        map(&state, &client, &ps2, &px2, 22);
+        assert_eq!(p1.rel.get(), p2.rel.get(), "siblings fully overlap");
+
+        let win = t1.window.borrow().clone().unwrap();
+        let r = win.draw_rect(&state);
+        let (rx, ry) = p2.rel.get();
+        let (px, py) = (r.x1 + rx + 5, r.y1 + ry + 5);
+        let (hit, _, _) = crate::tree::surface_at(&state, px, py).unwrap();
+        assert!(Rc::ptr_eq(&hit, &ps2), "the newest sibling popup is on top");
+
+        // unmapping the top sibling uncovers the older one
+        ps2.attach(wl_surface::attach::Request { buffer: ObjectId::NONE, x: 0, y: 0 })
+            .unwrap();
+        commit(&ps2);
+        let (hit, _, _) = crate::tree::surface_at(&state, px, py).unwrap();
+        assert!(Rc::ptr_eq(&hit, &ps1));
+    }
+
+    #[test]
+    fn nested_popup_siblings_hit_newest_first() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let base = mk_base(&client, 30);
+        let (s1, x1, t1) = mk_toplevel(&client, &base, 10, 40, 50);
+        map(&state, &client, &s1, &x1, 20);
+        let (psa, pxa, pa) = mk_popup(&client, &base, 11, 41, 45, 51, ObjectId(40));
+        map(&state, &client, &psa, &pxa, 21);
+        // two overlapping children of the first popup
+        let (c1s, c1x, _) = mk_popup(&client, &base, 12, 42, 46, 52, ObjectId(41));
+        map(&state, &client, &c1s, &c1x, 22);
+        let (c2s, c2x, c2) = mk_popup(&client, &base, 13, 43, 47, 53, ObjectId(41));
+        map(&state, &client, &c2s, &c2x, 23);
+
+        let win = t1.window.borrow().clone().unwrap();
+        let r = win.draw_rect(&state);
+        let (ax, ay) = pa.rel.get();
+        let (cx, cy) = c2.rel.get();
+        let (hit, _, _) =
+            crate::tree::surface_at(&state, r.x1 + ax + cx + 5, r.y1 + ay + cy + 5).unwrap();
+        assert!(Rc::ptr_eq(&hit, &c2s), "newest-first applies at every sibling level");
+    }
+
+    #[test]
+    fn layer_surface_popups_hit_newest_first() {
+        use crate::protocol::interfaces::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+        use zwlr_layer_shell_v1::Handler as _;
+        use zwlr_layer_surface_v1::Handler as _;
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        // a bar across the top of the output
+        let bar = WlSurface::new(ObjectId(10), &client, 6);
+        client.add_client_obj(bar.clone()).unwrap();
+        client.objects.track_surface(bar.clone());
+        let shell = Rc::new(crate::shell::layer::LayerShell {
+            id: ObjectId(90),
+            client: client.clone(),
+            version: 5,
+        });
+        shell
+            .get_layer_surface(zwlr_layer_shell_v1::get_layer_surface::Request {
+                id: ObjectId(20),
+                surface: ObjectId(10),
+                output: ObjectId::NONE,
+                layer: crate::shell::layer::TOP,
+                namespace: "test".to_string(),
+            })
+            .unwrap();
+        let ext = bar.ext.borrow().clone();
+        let ls = ext.layer_surface().unwrap();
+        ls.set_anchor(zwlr_layer_surface_v1::set_anchor::Request { anchor: 1 | 4 | 8 })
+            .unwrap();
+        ls.set_size(zwlr_layer_surface_v1::set_size::Request { width: 0, height: 32 })
+            .unwrap();
+        commit(&bar);
+        flush_configures(&state);
+        // the first configure on a fresh layer surface carries serial 1
+        ls.ack_configure(zwlr_layer_surface_v1::ack_configure::Request { serial: 1 })
+            .unwrap();
+        attach_commit(&client, &bar, 33);
+        assert!(ls.mapped());
+
+        // two overlapping popups adopted by the layer surface in creation order
+        let base = mk_base(&client, 30);
+        let (ps1, px1, _) = mk_popup(&client, &base, 11, 41, 45, 51, ObjectId::NONE);
+        ls.get_popup(zwlr_layer_surface_v1::get_popup::Request { popup: ObjectId(51) })
+            .unwrap();
+        map(&state, &client, &ps1, &px1, 34);
+        let (ps2, px2, p2) = mk_popup(&client, &base, 12, 42, 46, 52, ObjectId::NONE);
+        ls.get_popup(zwlr_layer_surface_v1::get_popup::Request { popup: ObjectId(52) })
+            .unwrap();
+        map(&state, &client, &ps2, &px2, 35);
+
+        let r = ls.rect.get();
+        let (rx, ry) = p2.rel.get();
+        let (hit, _, _) = crate::tree::surface_at(&state, r.x1 + rx + 5, r.y1 + ry + 5).unwrap();
+        assert!(Rc::ptr_eq(&hit, &ps2), "the newest layer-surface popup is on top");
+    }
+
+    /// a mapped bar across the top of the output on the given shell layer
+    fn mk_bar(
+        state: &Rc<State>,
+        client: &Rc<Client>,
+        sid: u32,
+        lid: u32,
+        layer: u32,
+        buf: u32,
+    ) -> (Rc<WlSurface>, Rc<crate::shell::layer::LayerSurface>) {
+        use crate::protocol::interfaces::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+        use zwlr_layer_shell_v1::Handler as _;
+        use zwlr_layer_surface_v1::Handler as _;
+        let s = WlSurface::new(ObjectId(sid), client, 6);
+        client.add_client_obj(s.clone()).unwrap();
+        client.objects.track_surface(s.clone());
+        let shell = Rc::new(crate::shell::layer::LayerShell {
+            id: ObjectId(90),
+            client: client.clone(),
+            version: 5,
+        });
+        shell
+            .get_layer_surface(zwlr_layer_shell_v1::get_layer_surface::Request {
+                id: ObjectId(lid),
+                surface: ObjectId(sid),
+                output: ObjectId::NONE,
+                layer,
+                namespace: "test".to_string(),
+            })
+            .unwrap();
+        let ls = crate::shell::layer::from_surface(state, &s).unwrap();
+        ls.set_anchor(zwlr_layer_surface_v1::set_anchor::Request { anchor: 1 | 4 | 8 })
+            .unwrap();
+        ls.set_size(zwlr_layer_surface_v1::set_size::Request { width: 0, height: 32 })
+            .unwrap();
+        commit(&s);
+        flush_configures(state);
+        // the first configure on a fresh layer surface carries serial 1
+        ls.ack_configure(zwlr_layer_surface_v1::ack_configure::Request { serial: 1 })
+            .unwrap();
+        attach_commit(client, &s, buf);
+        (s, ls)
+    }
+
+    #[test]
+    fn layer_popup_wins_input_over_a_higher_layer() {
+        use crate::protocol::interfaces::zwlr_layer_surface_v1;
+        use zwlr_layer_surface_v1::Handler as _;
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (_bar, ls) = mk_bar(&state, &client, 10, 20, crate::shell::layer::TOP, 33);
+        let base = mk_base(&client, 30);
+        let (ps, px, p) = mk_popup(&client, &base, 11, 41, 45, 51, ObjectId::NONE);
+        ls.get_popup(zwlr_layer_surface_v1::get_popup::Request { popup: ObjectId(51) })
+            .unwrap();
+        map(&state, &client, &ps, &px, 34);
+        // an overlay surface covering the same corner
+        let (ov, _lo) = mk_bar(&state, &client, 12, 21, crate::shell::layer::OVERLAY, 35);
+        let r = ls.rect.get();
+        let (rx, ry) = p.rel.get();
+        let (hit, _, _) = crate::tree::surface_at(&state, r.x1 + rx + 5, r.y1 + ry + 5).unwrap();
+        assert!(Rc::ptr_eq(&hit, &ps), "a layer popup outranks a higher layer");
+        // outside the popup the overlay still wins
+        let (hit, _, _) = crate::tree::surface_at(&state, r.x1 + 2, r.y1 + 2).unwrap();
+        assert!(Rc::ptr_eq(&hit, &ov));
+    }
+
+    #[test]
+    fn get_popup_rejects_an_already_parented_popup() {
+        use crate::protocol::interfaces::zwlr_layer_surface_v1;
+        use zwlr_layer_surface_v1::Handler as _;
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (_bar, ls) = mk_bar(&state, &client, 10, 20, crate::shell::layer::TOP, 33);
+        let base = mk_base(&client, 30);
+        let (s1, x1, _t1) = mk_toplevel(&client, &base, 11, 40, 50);
+        map(&state, &client, &s1, &x1, 34);
+        // a popup already parented to a toplevel cannot be adopted
+        let (_ps, _px, _p) = mk_popup(&client, &base, 12, 41, 45, 51, ObjectId(40));
+        ls.get_popup(zwlr_layer_surface_v1::get_popup::Request { popup: ObjectId(51) })
+            .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 1);
+        let mut n = 0;
+        ls.for_each_popup(|_| n += 1);
+        assert_eq!(n, 0, "the rejected popup was not adopted");
+        // a second adoption of the same popup fails too
+        let (_ps2, _px2, _p2) = mk_popup(&client, &base, 13, 42, 46, 52, ObjectId::NONE);
+        ls.get_popup(zwlr_layer_surface_v1::get_popup::Request { popup: ObjectId(52) })
+            .unwrap();
+        ls.get_popup(zwlr_layer_surface_v1::get_popup::Request { popup: ObjectId(52) })
+            .unwrap();
+        assert_eq!(count_events(&client.queued_out_bytes(), ERR, 0), 2);
+        let mut n = 0;
+        ls.for_each_popup(|_| n += 1);
+        assert_eq!(n, 1, "the popup was adopted exactly once");
+    }
+
+    #[test]
+    fn fullscreen_hides_popups_of_hidden_layers() {
+        use crate::protocol::interfaces::zwlr_layer_surface_v1;
+        use zwlr_layer_surface_v1::Handler as _;
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (_bar, ls) = mk_bar(&state, &client, 10, 20, crate::shell::layer::TOP, 33);
+        let base = mk_base(&client, 30);
+        let (ps, px, p) = mk_popup(&client, &base, 11, 41, 45, 51, ObjectId::NONE);
+        ls.get_popup(zwlr_layer_surface_v1::get_popup::Request { popup: ObjectId(51) })
+            .unwrap();
+        map(&state, &client, &ps, &px, 34);
+        let r = ls.rect.get();
+        let (rx, ry) = p.rel.get();
+        let (x, y) = (r.x1 + rx + 5, r.y1 + ry + 5);
+        let (hit, _, _) = crate::tree::surface_at(&state, x, y).unwrap();
+        assert!(Rc::ptr_eq(&hit, &ps));
+        // fullscreen hides the top bar and its popup with it
+        let (ws, wx, wt) = mk_toplevel(&client, &base, 12, 42, 52);
+        map(&state, &client, &ws, &wx, 35);
+        let win = wt.window.borrow().clone().unwrap();
+        crate::tree::set_fullscreen(&state, &win, true);
+        let (hit, _, _) = crate::tree::surface_at(&state, x, y).unwrap();
+        assert!(Rc::ptr_eq(&hit, &ws), "the popup hides with its parent layer");
+    }
+
+    #[test]
+    fn overlay_popups_stay_clickable_above_fullscreen() {
+        use crate::protocol::interfaces::zwlr_layer_surface_v1;
+        use zwlr_layer_surface_v1::Handler as _;
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let (_bar, ls) = mk_bar(&state, &client, 10, 20, crate::shell::layer::OVERLAY, 33);
+        let base = mk_base(&client, 30);
+        let (ps, px, p) = mk_popup(&client, &base, 11, 41, 45, 51, ObjectId::NONE);
+        ls.get_popup(zwlr_layer_surface_v1::get_popup::Request { popup: ObjectId(51) })
+            .unwrap();
+        map(&state, &client, &ps, &px, 34);
+        let (ws, wx, wt) = mk_toplevel(&client, &base, 12, 42, 52);
+        map(&state, &client, &ws, &wx, 35);
+        let win = wt.window.borrow().clone().unwrap();
+        crate::tree::set_fullscreen(&state, &win, true);
+        let r = ls.rect.get();
+        let (rx, ry) = p.rel.get();
+        let (hit, _, _) = crate::tree::surface_at(&state, r.x1 + rx + 5, r.y1 + ry + 5).unwrap();
+        assert!(Rc::ptr_eq(&hit, &ps), "an overlay popup keeps input above fullscreen");
+    }
+
+    #[test]
+    fn popup_bounds_follow_the_parents_output() {
+        use crate::protocol::interfaces::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+        use zwlr_layer_shell_v1::Handler as _;
+        use zwlr_layer_surface_v1::Handler as _;
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let base = mk_base(&client, 30);
+        let (s1, x1, _t1) = mk_toplevel(&client, &base, 10, 40, 50);
+        map(&state, &client, &s1, &x1, 60);
+        let union = Rect { x1: 0, y1: 0, x2: 800, y2: 600 };
+
+        // a toplevel parent resolves through its window's workspace
+        let (ps1, px1, p1) = mk_popup(&client, &base, 11, 41, 45, 51, ObjectId(40));
+        map(&state, &client, &ps1, &px1, 61);
+        let parent = p1.parent.borrow().clone().unwrap();
+        assert_eq!(parent.constraint_bounds(&state), union);
+
+        // a layer parent resolves through its output slot
+        let bar = WlSurface::new(ObjectId(12), &client, 6);
+        client.add_client_obj(bar.clone()).unwrap();
+        client.objects.track_surface(bar.clone());
+        let shell = Rc::new(crate::shell::layer::LayerShell {
+            id: ObjectId(90),
+            client: client.clone(),
+            version: 5,
+        });
+        shell
+            .get_layer_surface(zwlr_layer_shell_v1::get_layer_surface::Request {
+                id: ObjectId(21),
+                surface: ObjectId(12),
+                output: ObjectId::NONE,
+                layer: crate::shell::layer::TOP,
+                namespace: "test".to_string(),
+            })
+            .unwrap();
+        let ls = crate::shell::layer::from_surface(&state, &bar).unwrap();
+        let (ps2, px2, p2) = mk_popup(&client, &base, 13, 42, 46, 52, ObjectId::NONE);
+        ls.get_popup(zwlr_layer_surface_v1::get_popup::Request { popup: ObjectId(52) })
+            .unwrap();
+        map(&state, &client, &ps2, &px2, 62);
+        let parent = p2.parent.borrow().clone().unwrap();
+        assert_eq!(parent.constraint_bounds(&state), union);
+
+        // a nested popup walks its parent chain down to the toplevel
+        let (ps3, px3, p3) = mk_popup(&client, &base, 14, 43, 47, 53, ObjectId(41));
+        map(&state, &client, &ps3, &px3, 63);
+        let parent = p3.parent.borrow().clone().unwrap();
+        assert_eq!(parent.constraint_bounds(&state), union);
     }
 
     #[test]

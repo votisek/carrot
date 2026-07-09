@@ -818,7 +818,7 @@ fn window_hit(
     Some((win.clone(), s, sx, sy))
 }
 
-/// popups stack above parent, topmost last; positions relative to parent geometry
+/// popups stack above parent, newest sibling topmost; positions relative to parent geometry
 fn popup_hit(
     p: &Rc<crate::shell::xdg::XdgPopup>,
     ox: i32,
@@ -847,7 +847,7 @@ fn popups_hit(
     y: i32,
 ) -> Option<(Rc<WlSurface>, i32, i32)> {
     let mut hit = None;
-    xdg.for_each_popup(|p| {
+    xdg.for_each_popup_rev(|p| {
         if hit.is_none() {
             hit = popup_hit(p, ox, oy, x, y);
         }
@@ -857,11 +857,15 @@ fn popups_hit(
 
 // -- the full-scene hit test --
 
-// layer surfaces join the z order: overlay, top, the windows, bottom,
-// background. fullscreen hides top and everything below the windows.
+// layer-parented popups sit above every layer, then overlay, top, the
+// windows, bottom, background. fullscreen hides top and everything below
+// the windows.
 pub fn surface_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<WlSurface>, i32, i32)> {
     use crate::shell::layer;
     let fs_active = workspace_at(state, x, y).fullscreen.borrow().is_some();
+    if let Some(hit) = layer_popups_hit(state, x, y, fs_active) {
+        return Some(hit);
+    }
     for l in [layer::OVERLAY, layer::TOP] {
         if l == layer::TOP && fs_active {
             continue;
@@ -892,17 +896,38 @@ fn layer_hit(state: &Rc<State>, layer: u32, x: i32, y: i32) -> Option<(Rc<WlSurf
             continue;
         }
         let r = ls.rect.get();
+        if let Some(h) = ls.surface.find_surface_at(x - r.x1, y - r.y1) {
+            return Some(h);
+        }
+    }
+    None
+}
+
+// layer-parented popups form one band above every layer; a popup of a
+// layer hidden by fullscreen hides with its parent
+fn layer_popups_hit(
+    state: &Rc<State>,
+    x: i32,
+    y: i32,
+    fs_active: bool,
+) -> Option<(Rc<WlSurface>, i32, i32)> {
+    let layers = state.layers.borrow().clone();
+    for ls in layers.iter().rev() {
+        if !ls.mapped() {
+            continue;
+        }
+        if fs_active && ls.current.get().layer != crate::shell::layer::OVERLAY {
+            continue;
+        }
+        let r = ls.rect.get();
         let mut hit = None;
-        ls.for_each_popup(|p| {
+        ls.for_each_popup_rev(|p| {
             if hit.is_none() {
                 hit = popup_hit(p, r.x1, r.y1, x, y);
             }
         });
         if hit.is_some() {
             return hit;
-        }
-        if let Some(h) = ls.surface.find_surface_at(x - r.x1, y - r.y1) {
-            return Some(h);
         }
     }
     None
