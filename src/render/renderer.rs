@@ -739,41 +739,8 @@ impl Renderer {
         })
     }
 
-    fn transition_sampled(&self, image: vk::Image) -> Result<(), RenderError> {
-        let dev = &self.core.device;
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
-            .queue_family_index(self.core.queue_family);
-        let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
-        let pool_guard = crate::util::OnDrop(|| unsafe { dev.destroy_command_pool(pool, None) });
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cb = unsafe { dev.allocate_command_buffers(&alloc) }?[0];
-        let begin = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { dev.begin_command_buffer(cb, &begin) }?;
-        let barrier = image_barrier(image)
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        barrier2(dev, cb, &[barrier]);
-        unsafe { dev.end_command_buffer(cb) }?;
-        let cbs = [cb];
-        let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-        unsafe {
-            dev.queue_submit(self.core.queue, &[submit], vk::Fence::null())?;
-            dev.queue_wait_idle(self.core.queue)?;
-        }
-        drop(pool_guard);
-        Ok(())
-    }
-
-    /// render ops into an offscreen image and read the pixels back as tightly
-    /// packed rows. screenshot-grade: fully synchronous.
+    /// render ops into an offscreen image and read the pixels back as
+    /// tightly packed rows. screenshot-grade: fully synchronous.
     pub fn read_frame(
         &self,
         w: u32,
@@ -880,6 +847,41 @@ impl Renderer {
         drop(mem_guard);
         drop(img_guard);
         Ok(out)
+    }
+
+    /// synchronous one-shot layout transition; import-time work, not the
+    /// frame loop
+    fn transition_sampled(&self, image: vk::Image) -> Result<(), RenderError> {
+        let dev = &self.core.device;
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .queue_family_index(self.core.queue_family);
+        let pool = unsafe { dev.create_command_pool(&pool_info, None) }?;
+        let pool_guard = crate::util::OnDrop(|| unsafe { dev.destroy_command_pool(pool, None) });
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { dev.allocate_command_buffers(&alloc) }?[0];
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { dev.begin_command_buffer(cb, &begin) }?;
+        let barrier = image_barrier(image)
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        barrier2(dev, cb, &[barrier]);
+        unsafe { dev.end_command_buffer(cb) }?;
+        let cbs = [cb];
+        let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+        unsafe {
+            dev.queue_submit(self.core.queue, &[submit], vk::Fence::null())?;
+            dev.queue_wait_idle(self.core.queue)?;
+        }
+        drop(pool_guard);
+        Ok(())
     }
 
     /// blocking staging upload; `fill` writes tightly packed rows into the
