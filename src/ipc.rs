@@ -141,6 +141,7 @@ fn handle(state: &Rc<State>, line: &str) -> Result<Value, String> {
         Ok("monitors") => Ok(monitors_json(state)),
         Ok("workspaces") => Ok(workspaces_json(state)),
         Ok("windows") => Ok(windows_json(state)),
+        Ok("clients") => Ok(clients_json(state)),
         Ok("reload") => reload(state).map(|_| json!(true)),
         Ok("dpms-off") => {
             crate::output::dpms(state, false);
@@ -314,6 +315,42 @@ fn windows_json(state: &Rc<State>) -> Value {
             "focused": focus.as_ref().is_some_and(|f| Rc::ptr_eq(f, &w.surface())),
         }));
     });
+    json!(out)
+}
+
+/// every window on every workspace, with owner and placement detail;
+/// `windows` stays the light active-workspace view
+fn clients_json(state: &Rc<State>) -> Value {
+    let seat = state.seat.borrow().clone();
+    let focus = seat.and_then(|s| s.kb_focus.borrow().clone());
+    let list = state.workspaces.borrow().clone();
+    let mut out = Vec::new();
+    for (i, ws) in list.iter().enumerate() {
+        let output = state.display.borrow().as_ref().and_then(|d| {
+            d.outputs
+                .borrow()
+                .get(ws.output.get())
+                .map(|o| o.conn.name.clone())
+        });
+        ws.for_each(|w| {
+            let r = w.draw_rect(state);
+            let s = w.surface();
+            out.push(json!({
+                "id": s.uid,
+                "title": w.title(),
+                "app-id": w.app_id(),
+                "pid": s.client.pid,
+                "workspace": i + 1,
+                "output": output,
+                "x": r.x1, "y": r.y1, "w": r.width(), "h": r.height(),
+                "floating": w.floating.get(),
+                "fullscreen": w.fullscreen.get(),
+                "xwayland": w.x11_opt().is_some(),
+                "mapped": s.mapped.get(),
+                "focused": focus.as_ref().is_some_and(|f| Rc::ptr_eq(f, &s)),
+            }));
+        });
+    }
     json!(out)
 }
 
