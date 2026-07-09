@@ -376,6 +376,7 @@ pub fn send_to_workspace(state: &Rc<State>, n: usize, follow: bool) {
             .or_else(|| ws.top_float());
         focus_window(state, next.as_ref());
     }
+    crate::protocol::foreign_toplevel::output_changed(state, &win);
 }
 
 // the x server died; every window it owned goes with it

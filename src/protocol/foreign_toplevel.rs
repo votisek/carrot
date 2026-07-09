@@ -202,6 +202,17 @@ impl handle_v1::Handler for FtlHandle {
     fn activate(&self, _req: handle_v1::activate::Request) -> Result<(), Box<dyn std::error::Error>> {
         let state = self.client.state.clone();
         if let Some(win) = self.win() {
+            // bring its workspace up first, then hand it the keyboard
+            if let Some(ws) = crate::tree::workspace_of(&state, &win) {
+                let idx = state
+                    .workspaces
+                    .borrow()
+                    .iter()
+                    .position(|w| Rc::ptr_eq(w, &ws));
+                if let Some(idx) = idx {
+                    crate::tree::switch_workspace(&state, idx);
+                }
+            }
             crate::tree::focus_window(&state, Some(&win));
         }
         Ok(())
