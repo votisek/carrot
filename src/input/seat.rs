@@ -135,6 +135,14 @@ impl SeatGlobal {
         }))
     }
 
+    /// a session lock takes the seat: grabs and armed binds must not
+    /// survive into the locked state
+    pub fn prepare_for_lock(&self) {
+        *self.grab.borrow_mut() = None;
+        *self.armed_release.borrow_mut() = None;
+        self.cancel_repeat();
+    }
+
     pub fn cancel_repeat(&self) {
         self.repeat_key.set(None);
         self.repeat_version.fetch_add(1);
@@ -939,10 +947,15 @@ impl SeatGlobal {
             // hardcoded above so a broken config can't strand the seat
             let cfg = state.config.borrow().clone();
             use crate::config::BindKind;
+            // a locked session only honors lock-safe binds
+            let locked = crate::protocol::session_lock::locked(state);
             // a press of anything else disarms a waiting release bind
             let mut armed = None;
             for b in cfg.binds.iter() {
                 if held_mods == b.mods && key == b.key {
+                    if locked && b.kind != BindKind::LockSafe {
+                        continue;
+                    }
                     match b.kind {
                         BindKind::Mouse => continue,
                         BindKind::Release => {
@@ -954,8 +967,6 @@ impl SeatGlobal {
                             self.arm_repeat(key);
                             return KeyAction::Act(b.action.clone());
                         }
-                        // lock-safe fires like press until a session lock
-                        // exists to gate the rest
                         BindKind::Press | BindKind::LockSafe => {
                             self.cancel_repeat();
                             return KeyAction::Act(b.action.clone());

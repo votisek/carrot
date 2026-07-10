@@ -1086,6 +1086,7 @@ fn rescan(state: &Rc<State>) {
         drop(present);
         state.globals.remove(out.global_name.get());
         crate::protocol::image_copy_capture::output_removed(state, &out.conn.name);
+        crate::protocol::session_lock::output_removed(state, &out.conn.name);
         if let Some(p) = out.conn.pipe.borrow_mut().take() {
             // stop the kernel scanning a dead head before freeing the crtc
             let mut ch = crate::drm::atomic::Change::default();
@@ -1186,6 +1187,9 @@ fn finish_topology(state: &Rc<State>, d: &Display, old: &[Rc<Output>]) {
     let uw = outs.iter().map(|o| o.rect().x2).max().unwrap_or(1);
     let uh = outs.iter().map(|o| o.rect().y2).max().unwrap_or(1);
     state.output_size.set((uw as u32, uh as u32));
+    for o in outs.iter() {
+        crate::protocol::session_lock::output_resized(state, &o.conn.name);
+    }
 
     // old slot -> new slot by identity; the fallen map to slot 0
     let map: Vec<usize> = old
@@ -1552,6 +1556,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         // this present only ran because content changed: pending output
         // captures complete against the frame just shown
         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
+        crate::protocol::session_lock::output_presented(state, &out.conn.name);
     }
 }
 
@@ -1682,6 +1687,29 @@ fn tearing_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {
 fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
     let mut ops = Vec::new();
     let mut live: Vec<(ClientId, u64)> = Vec::new();
+    // a locked session shows nothing but the lock surface; an output
+    // without one stays a cleared frame
+    if crate::protocol::session_lock::locked(state) {
+        let screen = out.rect();
+        if let Some(s) = crate::protocol::session_lock::compose_locked(state, &out.conn.name) {
+            draw_surface_tree(out, &s, screen.x1, screen.y1, screen, 1.0, &mut ops, &mut live);
+        }
+        draw_sw_cursor(state, out, &mut ops);
+        // normal content must not keep textures alive across the lock
+        let mut textures = out.textures.borrow_mut();
+        let stale: Vec<_> = textures
+            .keys()
+            .filter(|k| !live.contains(k))
+            .copied()
+            .collect();
+        for k in stale {
+            if let Some((t, _)) = textures.remove(&k) {
+                out.retired_tex.borrow_mut().push(t);
+            }
+        }
+        drop(textures);
+        return ops;
+    }
     let ws = {
         let list = state.workspaces.borrow();
         match list.get(out.ws.get()) {

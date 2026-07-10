@@ -11,6 +11,16 @@ pub fn set_keyboard_focus(state: &Rc<State>, seat: &Rc<SeatGlobal>, new: Option<
     // a destroyed surface's id may already be recycled client-side;
     // naming it in enter/leave is a fatal error over there
     let new = new.filter(|s| !s.destroyed.get());
+    // while locked the keyboard belongs to lock surfaces; activation,
+    // layer locks and window focus all wait for the unlock
+    if crate::protocol::session_lock::locked(state) {
+        let allowed = new
+            .as_ref()
+            .is_none_or(|s| s.get_root().role.get() == crate::surface::SurfaceRole::LockSurface);
+        if !allowed {
+            return;
+        }
+    }
     let old = seat.kb_focus.borrow().clone();
     match (&old, &new) {
         (Some(a), Some(b)) if Rc::ptr_eq(a, b) => return,

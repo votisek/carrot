@@ -872,6 +872,10 @@ fn popups_hit(
 // the windows.
 pub fn surface_at(state: &Rc<State>, x: i32, y: i32) -> Option<(Rc<WlSurface>, i32, i32)> {
     use crate::shell::layer;
+    // a locked session has exactly one hittable thing per output
+    if crate::protocol::session_lock::locked(state) {
+        return crate::protocol::session_lock::surface_at(state, x, y);
+    }
     let fs_active = workspace_at(state, x, y).fullscreen.borrow().is_some();
     if let Some(hit) = layer_popups_hit(state, x, y, fs_active) {
         return Some(hit);

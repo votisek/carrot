@@ -180,6 +180,7 @@ impl Drop for ClientHolder {
         crate::shell::layer::drop_client(&self.data.state, self.data.id);
         crate::protocol::foreign_toplevel::drop_client(&self.data.state, self.data.id);
         self.data.state.idle.drop_client(self.data.id);
+        crate::protocol::session_lock::drop_client(&self.data.state, self.data.id);
         self.data.flush_request.clear();
         self.data.shutdown.clear();
     }

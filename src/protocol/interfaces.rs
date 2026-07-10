@@ -578,6 +578,28 @@ crate::wl_protocol! {
 }
 
 crate::wl_protocol! {
+    interface ext_session_lock_manager_v1, version = 1;
+    request destroy();
+    request lock(id: new_id);
+}
+
+crate::wl_protocol! {
+    interface ext_session_lock_v1, version = 1;
+    request destroy();
+    request get_lock_surface(id: new_id, surface: object, output: object);
+    request unlock_and_destroy();
+    event locked();
+    event finished();
+}
+
+crate::wl_protocol! {
+    interface ext_session_lock_surface_v1, version = 1;
+    request destroy();
+    request ack_configure(serial: uint);
+    event configure(serial: uint, width: uint, height: uint);
+}
+
+crate::wl_protocol! {
     interface zxdg_output_manager_v1, version = 3;
     request destroy();
     request get_xdg_output(id: new_id, output: object);

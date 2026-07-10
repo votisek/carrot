@@ -10,6 +10,7 @@ pub mod foreign_toplevel;
 pub mod foreign_toplevel_list;
 pub mod globals;
 pub mod idle;
+pub mod session_lock;
 pub mod image_copy_capture;
 pub mod interfaces;
 pub mod output;

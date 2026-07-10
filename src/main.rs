@@ -205,6 +205,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     state
         .globals
         .add(std::rc::Rc::new(protocol::idle::IdleInhibitGlobal));
+    state
+        .globals
+        .add(std::rc::Rc::new(protocol::session_lock::SessionLockManagerGlobal));
     let st = state.clone();
     let _idle_pump = engine.spawn("idle pump", protocol::idle::pump(st));
     let st = state.clone();
