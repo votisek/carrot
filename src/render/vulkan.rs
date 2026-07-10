@@ -86,7 +86,7 @@ fn has_ext(exts: &[vk::ExtensionProperties], name: &CStr) -> bool {
 impl VkCore {
     pub fn new(card: BorrowedFd<'_>) -> Result<VkCore, RenderError> {
         let rdev = fstat(card).map_err(|e| RenderError::Load(e.to_string()))?.st_rdev;
-        let entry: ash::Entry = Err(RenderError::Load("icd loader not wired yet".into()))?;
+        let entry = super::loader::entry_for(card)?;
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let info = vk::InstanceCreateInfo::default().application_info(&app);
         let instance = unsafe { entry.create_instance(&info, None) }?;

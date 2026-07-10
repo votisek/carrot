@@ -7,6 +7,7 @@
 // NOTE: premult alpha, dual image views, per-window scissor, geometry offset
 // silently break real clients when missing.
 
+pub mod loader;
 pub mod renderer;
 pub mod shaders;
 pub mod vulkan;

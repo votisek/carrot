@@ -12,6 +12,8 @@ eyra = { version = "0.22", features = ["experimental-relocate"] }
 # no default features: no `loaded`/libloading (pulls dl* nothing defines);
 # the entry comes from the icd via dlopen-rs + Entry::from_static_fn
 ash = { version = "0.38", default-features = false }
+# pure-rust dynamic linker: loads the mesa icd + its closure against taproot
+dlopen-rs = "0.8"
 rustix = { version = "1.1.4", features = ["net", "fs", "event", "io_uring", "mm", "param", "pipe", "time", "process"] }
 kbvm = "0.1.6"
 
