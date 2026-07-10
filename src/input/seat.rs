@@ -1052,6 +1052,23 @@ impl SeatGlobal {
             _ => false,
         };
         if same {
+            // the surface can change its painted origin under a stationary
+            // cursor (fullscreen, retile). coordinates are surface-local, so
+            // rebase and tell the client where it now stands via a motion -
+            // no leave/enter, the surface is still the same one
+            if let Some((s, lx, ly)) = &hit {
+                let origin = (x as i32 - lx, y as i32 - ly);
+                if origin != self.ptr_origin.get() && !s.destroyed.get() {
+                    self.ptr_origin.set(origin);
+                    let ms = (crate::util::Time::now().nsec() / 1_000_000) as u32;
+                    let (fx, fy) = (Fixed::from_int(*lx), Fixed::from_int(*ly));
+                    self.for_each_pointer(s.client.id, 1, |p| {
+                        p.client
+                            .event(|o| wl_pointer::motion::send(o, p.id, ms, fx, fy));
+                    });
+                    self.ptr_frame(s.client.id);
+                }
+            }
             return;
         }
         if let Some(old) = cur {
@@ -1538,6 +1555,7 @@ mod tests {
     };
     use crate::protocol::pointer_constraints::{ConstraintsManager, LockedPointer};
     use wl_pointer::Handler as _;
+    use wl_seat::Handler as _;
     use zwp_locked_pointer_v1::Handler as _;
     use zwp_pointer_constraints_v1::Handler as _;
 
@@ -1577,6 +1595,50 @@ mod tests {
             region: ObjectId(0),
             lifetime,
         })
+    }
+
+    #[test]
+    fn fullscreen_under_a_stationary_cursor_rebases_pointer_coords() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        // a bound seat with one wl_pointer so coordinate events hit the wire
+        let bind = Rc::new(WlSeat {
+            id: ObjectId(80),
+            client: client.clone(),
+            version: 9,
+            global: seat.clone(),
+            keyboards: RefCell::new(Vec::new()),
+            pointers: RefCell::new(Vec::new()),
+        });
+        client.add_client_obj(bind.clone()).unwrap();
+        seat.bindings.borrow_mut().entry(client.id).or_default().push(bind.clone());
+        bind.get_pointer(wl_seat::get_pointer::Request { id: ObjectId(81) }).unwrap();
+
+        // two tiled windows: mapping the second slides the first into the
+        // right half at x=400. that first one gets a buffer big enough to
+        // stay under the cursor at both origins
+        let base = crate::shell::xdg::tests::mk_base(&client, 30);
+        let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
+        let (sb, xb, _tb) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 11, 41, 51);
+        crate::shell::xdg::tests::map(&state, &client, &sb, &xb, 21);
+        seat.warp(&state, 410.0, 10.0);
+        assert!(seat.pointer_focus().is_some_and(|f| Rc::ptr_eq(&f, &sa)));
+        assert_eq!(seat.ptr_origin.get(), (400, 0));
+        let ptr = ObjectId(81);
+        let bytes = client.queued_out_bytes();
+        let (leaves, motions) = (count_events(&bytes, ptr, 1), count_events(&bytes, ptr, 2));
+
+        // fullscreen the window under the stationary cursor: same surface,
+        // new painted origin. coordinates must follow, without a re-enter
+        let win = crate::tree::window_for_surface(&state, &sa).unwrap();
+        crate::tree::set_fullscreen(&state, &win, true);
+        assert_eq!(seat.ptr_origin.get(), (0, 0), "origin follows the fullscreen rect");
+        let bytes = client.queued_out_bytes();
+        assert_eq!(count_events(&bytes, ptr, 1), leaves, "same surface, no leave");
+        assert!(count_events(&bytes, ptr, 2) > motions, "a motion rebases the client's view");
     }
 
     #[test]

@@ -1523,7 +1523,7 @@ pub async fn configure_loop(state: Rc<State>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::client::test_utils::{count_events, test_client};
     use crate::protocol::interfaces::wl_surface;
@@ -1535,7 +1535,7 @@ mod tests {
 
     const ERR: ObjectId = ObjectId(1);
 
-    fn mk_base(client: &Rc<Client>, id: u32) -> Rc<XdgWmBase> {
+    pub(crate) fn mk_base(client: &Rc<Client>, id: u32) -> Rc<XdgWmBase> {
         let base = Rc::new_cyclic(|me| XdgWmBase {
             id: ObjectId(id),
             client: client.clone(),
@@ -1547,7 +1547,7 @@ mod tests {
         base
     }
 
-    fn mk_toplevel(
+    pub(crate) fn mk_toplevel(
         client: &Rc<Client>,
         base: &Rc<XdgWmBase>,
         sid: u32,
@@ -1589,14 +1589,29 @@ mod tests {
     }
 
     /// first commit -> initial configure, ack, buffer -> mapped
-    fn map(state: &Rc<State>, client: &Rc<Client>, s: &Rc<WlSurface>, xdg: &Rc<XdgSurface>, buf: u32) {
+    pub(crate) fn map(state: &Rc<State>, client: &Rc<Client>, s: &Rc<WlSurface>, xdg: &Rc<XdgSurface>, buf: u32) {
+        map_sized(state, client, s, xdg, buf, 64, 64);
+    }
+
+    pub(crate) fn map_sized(
+        state: &Rc<State>,
+        client: &Rc<Client>,
+        s: &Rc<WlSurface>,
+        xdg: &Rc<XdgSurface>,
+        buf: u32,
+        w: i32,
+        h: i32,
+    ) {
         commit(s);
         flush_configures(state);
         xdg.ack_configure(xdg_surface::ack_configure::Request {
             serial: xdg.last_sent.get(),
         })
         .unwrap();
-        attach_commit(client, s, buf);
+        let b = test_buffer(client, ObjectId(buf), w, h);
+        s.attach(wl_surface::attach::Request { buffer: b.id, x: 0, y: 0 })
+            .unwrap();
+        commit(s);
     }
 
     #[test]

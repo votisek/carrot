@@ -705,6 +705,11 @@ pub fn set_fullscreen(state: &Rc<State>, win: &Rc<Window>, on: bool) {
         win.fullscreen.set(false);
         win.configure_rect();
     }
+    // the window's painted origin just jumped; a stationary cursor over it
+    // needs its surface-local coordinates rebased
+    if let Some(seat) = state.seat.borrow().clone() {
+        seat.repick(state);
+    }
     crate::ipc::emit(state, &serde_json::json!({ "fullscreen": on }));
     crate::protocol::foreign_toplevel::state_changed(state, win);
     state.damage.trigger();
