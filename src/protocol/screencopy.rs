@@ -46,6 +46,7 @@ impl ScreencopyManager {
         id: ObjectId,
         output: ObjectId,
         region: Option<(i32, i32, i32, i32)>,
+        overlay_cursor: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let c = &self.client;
         let name = c.objects.output(output).map(|o| o.name.clone());
@@ -57,6 +58,7 @@ impl ScreencopyManager {
             slot: geo.map(|(i, ..)| i),
             rect: Cell::new(Rect::default()),
             used: Cell::new(false),
+            overlay_cursor,
         });
         c.add_client_obj(frame.clone())?;
         let Some((_, ow, oh)) = geo else {
@@ -92,9 +94,7 @@ impl zwlr_screencopy_manager_v1::Handler for ScreencopyManager {
         &self,
         req: zwlr_screencopy_manager_v1::capture_output::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // the hardware cursor rides its own plane; overlay is best-effort
-        // per spec and we don't compose it
-        self.make_frame(req.frame, req.output, None)
+        self.make_frame(req.frame, req.output, None, req.overlay_cursor != 0)
     }
 
     fn capture_output_region(
@@ -105,6 +105,7 @@ impl zwlr_screencopy_manager_v1::Handler for ScreencopyManager {
             req.frame,
             req.output,
             Some((req.x, req.y, req.width, req.height)),
+            req.overlay_cursor != 0,
         )
     }
 
@@ -143,6 +144,8 @@ pub struct ScreencopyFrame {
     slot: Option<usize>,
     rect: Cell<Rect>,
     used: Cell<bool>,
+    /// compose the pointer into the copy (the wlr overlay_cursor flag)
+    overlay_cursor: bool,
 }
 
 impl ScreencopyFrame {
@@ -181,7 +184,7 @@ impl ScreencopyFrame {
             c.protocol_error(self.id, ERR_INVALID_BUFFER, "copy needs an shm buffer");
             return Ok(());
         };
-        let Some(px) = crate::output::screencopy(&c.state, slot, rect) else {
+        let Some(px) = crate::output::screencopy(&c.state, slot, rect, self.overlay_cursor) else {
             c.event(|o| zwlr_screencopy_frame_v1::failed::send(o, self.id));
             return Ok(());
         };

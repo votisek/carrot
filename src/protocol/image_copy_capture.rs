@@ -283,7 +283,7 @@ impl manager_v1::Handler for IccManager {
         req: manager_v1::create_session::Request,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let c = &self.client;
-        // paint_cursors is the only defined option; accepted, best-effort
+        // paint_cursors is the only defined option
         if req.options & !OPT_PAINT_CURSORS != 0 {
             c.protocol_error(self.id, ERR_INVALID_OPTION, "unknown option bits");
             return Ok(());
@@ -292,7 +292,13 @@ impl manager_v1::Handler for IccManager {
             c.invalid_object(req.source);
             return Ok(());
         };
-        let sess = new_session(c, req.session, self.version, src.kind.snapshot());
+        let sess = new_session(
+            c,
+            req.session,
+            self.version,
+            src.kind.snapshot(),
+            req.options & OPT_PAINT_CURSORS != 0,
+        );
         c.add_client_obj(sess.clone())?;
         let state = &c.state;
         match sess.current_size(state) {
@@ -380,6 +386,8 @@ pub struct IccSession {
     /// the next capture completes synchronously: session birth, and again
     /// after any failure
     force: Cell<bool>,
+    /// compose the pointer into captures (the paint_cursors option)
+    paint_cursors: bool,
     /// one constraint re-burst per size race, cleared by the next attach
     size_debounce: Cell<bool>,
 }
@@ -389,6 +397,7 @@ fn new_session(
     id: ObjectId,
     version: u32,
     source: SourceKind,
+    paint_cursors: bool,
 ) -> Rc<IccSession> {
     Rc::new_cyclic(|me| IccSession {
         id,
@@ -402,6 +411,7 @@ fn new_session(
         buffer: RefCell::new(None),
         force: Cell::new(true),
         size_debounce: Cell::new(false),
+        paint_cursors,
     })
 }
 
@@ -529,7 +539,7 @@ fn service(state: &Rc<State>, sess: &Rc<IccSession>) {
     let (px, src_stride) = match src {
         Src::Out(slot) => {
             let region = Rect::new_sized_saturating(0, 0, cw as i32, ch as i32);
-            match crate::output::screencopy(state, slot, region) {
+            match crate::output::screencopy(state, slot, region, sess.paint_cursors) {
                 Some(px) => (px, row),
                 None => {
                     fail_frame(sess, REASON_UNKNOWN);
@@ -761,7 +771,7 @@ impl cursor_session_v1::Handler for IccCursorSession {
             return Ok(());
         }
         // no cursor capture path yet: an honest stop, not a stalled client
-        let sess = new_session(c, req.session, self.version, self.source.snapshot());
+        let sess = new_session(c, req.session, self.version, self.source.snapshot(), false);
         c.add_client_obj(sess.clone())?;
         sess.stopped.set(true);
         c.event(|o| session_v1::stopped::send(o, sess.id));

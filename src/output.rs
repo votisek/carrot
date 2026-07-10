@@ -673,11 +673,11 @@ pub async fn start(state: &Rc<State>, session: Option<&Rc<LogindSession>>) -> Op
 /// screenshot capture: compose the output like a present would, render
 /// offscreen, read back, crop to the output-local region. rows come back
 /// tightly packed (stride = width * 4).
-pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect) -> Option<Vec<u8>> {
+pub fn screencopy(state: &Rc<State>, out_index: usize, region: Rect, cursor: bool) -> Option<Vec<u8>> {
     let d = state.display.borrow();
     let out = d.as_ref()?.outputs.borrow().get(out_index)?.clone();
     drop(d);
-    let ops = compose(state, &out);
+    let ops = compose_ops(state, &out, if cursor { CapCursor::Always } else { CapCursor::Never });
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
@@ -763,18 +763,20 @@ pub fn output_geometry(state: &Rc<State>, name: &str) -> Option<(usize, u32, u32
 }
 
 /// the composited cursor: topmost, on the output under the pointer only
-fn draw_sw_cursor(state: &Rc<State>, out: &Rc<Output>, ops: &mut Vec<RenderOp>) {
+fn draw_sw_cursor(state: &Rc<State>, out: &Rc<Output>, ops: &mut Vec<RenderOp>, force: bool) {
     let d = state.display.borrow();
     let Some(d) = d.as_ref() else { return };
     // joined-pipe outputs have no plane at all; they composite regardless
-    // of the global software-cursor setting
+    // of the global software-cursor setting. force paints for captures even
+    // where the live path scans out on a hardware plane; a hidden cursor
+    // stays hidden either way
     let plane_less = out
         .conn
         .pipe
         .borrow()
         .as_ref()
         .is_none_or(|p| p.cursor.is_none());
-    if !(d.sw.get() || plane_less) || d.sw_hidden.get() || out.cursor_locked.get() {
+    if !(force || d.sw.get() || plane_less) || d.sw_hidden.get() || out.cursor_locked.get() {
         return;
     }
     let Some(seat) = state.seat.borrow().clone() else { return };
@@ -1684,7 +1686,20 @@ fn tearing_wanted(state: &Rc<State>, out: &Rc<Output>) -> bool {
 /// paint order tiled, fullscreen, floats; each window drawn as its surface
 /// stack, clipped to the window box so CSD can't leak past the tile. popups
 /// sit above their window.
+/// how a composition treats the cursor: presents follow the hw/sw split,
+/// captures follow the requesting client's overlay flag
+#[derive(Clone, Copy, PartialEq)]
+enum CapCursor {
+    Present,
+    Always,
+    Never,
+}
+
 fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
+    compose_ops(state, out, CapCursor::Present)
+}
+
+fn compose_ops(state: &Rc<State>, out: &Rc<Output>, cursor: CapCursor) -> Vec<RenderOp> {
     let mut ops = Vec::new();
     let mut live: Vec<(ClientId, u64)> = Vec::new();
     // a locked session shows nothing but the lock surface; an output
@@ -1694,7 +1709,9 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
         if let Some(s) = crate::protocol::session_lock::compose_locked(state, &out.conn.name) {
             draw_surface_tree(out, &s, screen.x1, screen.y1, screen, 1.0, &mut ops, &mut live);
         }
-        draw_sw_cursor(state, out, &mut ops);
+        if cursor != CapCursor::Never {
+            draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
+        }
         // normal content must not keep textures alive across the lock
         let mut textures = out.textures.borrow_mut();
         let stale: Vec<_> = textures
@@ -1784,7 +1801,9 @@ fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
             }
         }
     }
-    draw_sw_cursor(state, out, &mut ops);
+    if cursor != CapCursor::Never {
+        draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
+    }
 
     // textures for gone buffers don't outlive the frame
     let mut textures = out.textures.borrow_mut();
