@@ -16,16 +16,17 @@ const PROXY_ID: u32 = 2;
 const COOKIE: i32 = 0x0ca5;
 
 /// what a session's token restores; windows match by ident in-session and
-/// by app id + title across restarts (idents reset with the compositor)
-#[derive(Clone)]
+/// by app id + title across restarts (idents reset with the compositor).
+/// the tag shape is the on-disk token format - change it and old tokens die
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum RestoreData {
-    Output(String),
+    Output { name: String },
     Window { ident: u64, app_id: String, title: String },
+    Workspace { index: usize },
 }
 
 pub enum Pick {
-    Monitor,
-    Window,
     /// a picker choice; the window must still exist
     Ident(u64),
     Restored(RestoreData),
@@ -34,6 +35,9 @@ pub enum Pick {
 enum Source {
     Output(String),
     Window { win: Weak<Window>, ident: u64, app_id: String, title: String },
+    /// follows the workspace across outputs, streaming only while it
+    /// is on glass; reachable through the picker, not the portal types
+    Workspace(usize),
 }
 
 pub struct Cast {
@@ -126,13 +130,8 @@ pub async fn start(
 
 fn resolve(state: &Rc<State>, pick: Pick) -> Result<(Source, u32, u32, u32, (i32, i32)), PwError> {
     match pick {
-        Pick::Monitor => output_source(state, None),
-        Pick::Restored(RestoreData::Output(name)) => output_source(state, Some(&name)),
-        Pick::Window => {
-            let win = crate::tree::focused_window(state)
-                .ok_or(PwError::Env("no focused window to cast"))?;
-            window_source(state, win)
-        }
+        Pick::Restored(RestoreData::Output { name }) => output_source(state, &name),
+        Pick::Restored(RestoreData::Workspace { index }) => workspace_source(state, index),
         Pick::Ident(ident) => {
             let win = window_by_ident(state, ident)
                 .ok_or(PwError::Env("the chosen window is gone"))?;
@@ -149,22 +148,55 @@ fn resolve(state: &Rc<State>, pick: Pick) -> Result<(Source, u32, u32, u32, (i32
     }
 }
 
+/// a vanished output falls back to the focused one rather than failing
+/// the restore outright
 fn output_source(
     state: &Rc<State>,
-    name: Option<&str>,
+    name: &str,
 ) -> Result<(Source, u32, u32, u32, (i32, i32)), PwError> {
     let d = state.display.borrow();
     let outs = d
         .as_ref()
         .map(|d| d.outputs.borrow().clone())
         .unwrap_or_default();
-    let out = name
-        .and_then(|n| outs.iter().find(|o| o.conn.name == n))
+    let out = outs
+        .iter()
+        .find(|o| o.conn.name == name)
         .or_else(|| outs.get(state.focused_output.get()))
         .or_else(|| outs.first())
         .ok_or(PwError::Env("no output to cast"))?;
     Ok((
         Source::Output(out.conn.name.clone()),
+        out.width,
+        out.height,
+        refresh(out),
+        out.pos.get(),
+    ))
+}
+
+/// a workspace sizes as its assigned output; the stream renegotiates if
+/// it later shows somewhere else
+fn workspace_source(
+    state: &Rc<State>,
+    index: usize,
+) -> Result<(Source, u32, u32, u32, (i32, i32)), PwError> {
+    let out_slot = state
+        .workspaces
+        .borrow()
+        .get(index)
+        .map(|ws| ws.output.get())
+        .ok_or(PwError::Env("no such workspace"))?;
+    let d = state.display.borrow();
+    let outs = d
+        .as_ref()
+        .map(|d| d.outputs.borrow().clone())
+        .unwrap_or_default();
+    let out = outs
+        .get(out_slot)
+        .or_else(|| outs.first())
+        .ok_or(PwError::Env("no output to cast"))?;
+    Ok((
+        Source::Workspace(index),
         out.width,
         out.height,
         refresh(out),
@@ -271,12 +303,13 @@ impl Cast {
     /// what a fresh token for this cast should restore
     pub fn restore_data(&self) -> RestoreData {
         match &self.source {
-            Source::Output(n) => RestoreData::Output(n.clone()),
+            Source::Output(n) => RestoreData::Output { name: n.clone() },
             Source::Window { ident, app_id, title, .. } => RestoreData::Window {
                 ident: *ident,
                 app_id: app_id.clone(),
                 title: title.clone(),
             },
+            Source::Workspace(index) => RestoreData::Workspace { index: *index },
         }
     }
 
@@ -319,6 +352,22 @@ impl Cast {
                     return;
                 }
                 (Cap::Win(win), rect.width() as u32, rect.height() as u32)
+            }
+            Source::Workspace(index) => {
+                let Some(ws) = state.workspaces.borrow().get(*index).cloned() else {
+                    self.dead.set(true);
+                    return;
+                };
+                let Some(shown) = shown_workspace(state, presented) else {
+                    return;
+                };
+                if !Rc::ptr_eq(&ws, &shown) {
+                    return;
+                }
+                let Some((idx, w, h)) = crate::output::output_geometry(state, presented) else {
+                    return;
+                };
+                (Cap::Out(idx), w, h)
             }
         };
         {

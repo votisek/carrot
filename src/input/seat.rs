@@ -47,6 +47,9 @@ pub struct SeatGlobal {
     ptr_focus: RefCell<Option<Rc<WlSurface>>>,
     ptr_origin: Cell<(i32, i32)>,
     ptr_buttons: RefCell<Vec<u32>>,
+    /// buttons whose press a screencast pick consumed; their releases
+    /// stay consumed too
+    pick_swallow: RefCell<Vec<u32>>,
     /// serial of the newest button press; start_drag names it
     last_press_serial: Cell<u32>,
     /// remap translations held down: from -> to, so a release always
@@ -118,6 +121,7 @@ impl SeatGlobal {
             ptr_focus: RefCell::new(None),
             ptr_origin: Cell::new((0, 0)),
             ptr_buttons: RefCell::new(Vec::new()),
+            pick_swallow: RefCell::new(Vec::new()),
             last_press_serial: Cell::new(0),
             remap_held: RefCell::new(HashMap::new()),
             armed_release: RefCell::new(None),
@@ -926,6 +930,14 @@ impl SeatGlobal {
             }
         }
 
+        // Escape cancels a pending screencast pick and goes no further
+        if pressed && key == 1 {
+            if let Some(pick) = state.cast_pick.borrow_mut().take() {
+                pick.done.trigger();
+                return KeyAction::Handled;
+            }
+        }
+
         // binds exact-match the depressed set masked to shift|ctrl|alt|super
         if pressed {
             const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6);
@@ -1232,6 +1244,30 @@ impl SeatGlobal {
                 self.end_grab(state);
             }
             return;
+        }
+        // a pending screencast pick eats the next click: it is consent,
+        // not input. left selects, anything else cancels
+        if pressed {
+            let pick = state.cast_pick.borrow_mut().take();
+            if let Some(pick) = pick {
+                self.pick_swallow.borrow_mut().push(button);
+                if button == 0x110 {
+                    *pick.result.borrow_mut() = crate::portal::cast_pick_at(
+                        state,
+                        pick.types,
+                        self.ptr_x.get(),
+                        self.ptr_y.get(),
+                    );
+                }
+                pick.done.trigger();
+                return;
+            }
+        } else {
+            let mut sw = self.pick_swallow.borrow_mut();
+            if let Some(i) = sw.iter().position(|&b| b == button) {
+                sw.remove(i);
+                return;
+            }
         }
         let focus = self.ptr_focus.borrow().clone();
         // a press outside the popup grab chain dismisses it; the click
@@ -1859,5 +1895,44 @@ mod tests {
         assert!(matches!(&*seat.cursor.borrow(), CursorState::Surface(_)));
         // no buffer yet: hidden on the plane, but the state tracks the surface
         cs.commit_impl();
+    }
+
+    #[test]
+    fn a_cast_pick_eats_the_click_and_escape_cancels() {
+        let (state, client) = test_client();
+        state.output_size.set((800, 600));
+        let seat = SeatGlobal::new().unwrap();
+        *state.seat.borrow_mut() = Some(seat.clone());
+        let base = crate::shell::xdg::tests::mk_base(&client, 30);
+        let (sa, xa, _ta) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 10, 40, 50);
+        crate::shell::xdg::tests::map_sized(&state, &client, &sa, &xa, 20, 800, 600);
+        seat.warp(&state, 100.0, 100.0);
+
+        let pick = Rc::new(crate::portal::PendingPick {
+            types: 2, // windows
+            done: Default::default(),
+            result: RefCell::new(None),
+        });
+        *state.cast_pick.borrow_mut() = Some(pick.clone());
+        seat.pointer_button(&state, 0, 0x110, true);
+        assert!(state.cast_pick.borrow().is_none(), "the click answered the pick");
+        assert!(matches!(
+            pick.result.borrow().as_ref(),
+            Some(crate::portal::cast::RestoreData::Window { .. })
+        ));
+        // the matching release stays consumed
+        seat.pointer_button(&state, 0, 0x110, false);
+        assert!(seat.pick_swallow.borrow().is_empty());
+
+        let pick = Rc::new(crate::portal::PendingPick {
+            types: 1,
+            done: Default::default(),
+            result: RefCell::new(None),
+        });
+        *state.cast_pick.borrow_mut() = Some(pick.clone());
+        let act = seat.key(&state, 0, 1, true);
+        assert!(matches!(act, KeyAction::Handled), "Escape goes no further");
+        assert!(state.cast_pick.borrow().is_none());
+        assert!(pick.result.borrow().is_none(), "cancel answers with nothing");
     }
 }

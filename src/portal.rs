@@ -56,7 +56,131 @@ impl Default for Session {
 }
 
 type Sessions = Rc<RefCell<HashMap<String, Session>>>;
-type Tokens = Rc<RefCell<HashMap<String, cast::RestoreData>>>;
+
+struct Token {
+    data: cast::RestoreData,
+    /// survives restarts (persist mode 2); mirrored to the state file
+    disk: bool,
+}
+
+type Tokens = Rc<RefCell<HashMap<String, Token>>>;
+
+fn token_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })?;
+    Some(base.join("carrot").join("screencast-tokens.json"))
+}
+
+fn load_tokens() -> HashMap<String, Token> {
+    let Some(path) = token_path() else {
+        return HashMap::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    match serde_json::from_str::<HashMap<String, cast::RestoreData>>(&text) {
+        Ok(m) => m
+            .into_iter()
+            .map(|(k, data)| (k, Token { data, disk: true }))
+            .collect(),
+        Err(e) => {
+            eprintln!("carrot: portal: {}: {e}", path.display());
+            HashMap::new()
+        }
+    }
+}
+
+fn save_tokens(tokens: &HashMap<String, Token>) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(path) = token_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let disk: HashMap<&String, &cast::RestoreData> = tokens
+        .iter()
+        .filter(|(_, t)| t.disk)
+        .map(|(k, t)| (k, &t.data))
+        .collect();
+    let Ok(text) = serde_json::to_string(&disk) else { return };
+    // tokens are standing consent: owner-only
+    let res = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut f| f.write_all(text.as_bytes()));
+    if let Err(e) = res {
+        eprintln!("carrot: portal: {}: {e}", path.display());
+    }
+}
+
+/// a click-to-select in flight; the seat answers it from the next click
+pub struct PendingPick {
+    pub types: u32,
+    pub done: crate::util::AsyncEvent,
+    pub result: RefCell<Option<cast::RestoreData>>,
+}
+
+/// what a consent click at the pointer lands on: a window when the session
+/// allows windows, else the output under the cursor
+pub fn cast_pick_at(state: &Rc<State>, types: u32, x: f64, y: f64) -> Option<cast::RestoreData> {
+    if types & SOURCE_WINDOW != 0 {
+        if let Some((s, _, _)) = crate::tree::surface_at(state, x as i32, y as i32) {
+            if let Some(w) = crate::tree::window_for_surface(state, &s.get_root()) {
+                return Some(cast::RestoreData::Window {
+                    ident: w.ident,
+                    app_id: w.app_id(),
+                    title: w.title(),
+                });
+            }
+        }
+    }
+    if types & SOURCE_MONITOR != 0 {
+        let d = state.display.borrow();
+        let outs = d.as_ref()?.outputs.borrow().clone();
+        let out = outs
+            .iter()
+            .find(|o| o.rect().contains(x as i32, y as i32))
+            .or_else(|| outs.get(state.focused_output.get()))?;
+        return Some(cast::RestoreData::Output { name: out.conn.name.clone() });
+    }
+    None
+}
+
+/// zero-config consent: arm the seat and wait for a click (Escape or any
+/// non-left button cancels). no seat means nobody can answer - cancel now
+async fn seat_pick(state: &Rc<State>, types: u32) -> Option<cast::RestoreData> {
+    if state.seat.borrow().is_none() {
+        return None;
+    }
+    let pending = Rc::new(PendingPick {
+        types,
+        done: Default::default(),
+        result: RefCell::new(None),
+    });
+    *state.cast_pick.borrow_mut() = Some(pending.clone());
+    let watchdog = state.eng.spawn("pick watchdog", {
+        let p = pending.clone();
+        let ring = state.ring.clone();
+        async move {
+            let deadline = crate::util::Time::from_nsec(
+                crate::util::Time::now().nsec() + 120 * 1_000_000_000,
+            );
+            if ring.timeout(deadline).await.is_ok() {
+                p.done.trigger();
+            }
+        }
+    });
+    pending.done.triggered().await;
+    drop(watchdog);
+    *state.cast_pick.borrow_mut() = None;
+    pending.result.borrow_mut().take()
+}
 
 fn reply_response(c: &DbusConn, call: &MethodCall, code: u32) {
     c.reply(call, "ua{sv}", |b| {
@@ -125,7 +249,8 @@ fn serve_properties(conn: &Rc<DbusConn>) {
 /// the streams a(ua{sv}) results entry: node id plus geometry
 fn put_streams_entry(b: &mut MsgBuilder, cast: &cast::Cast) {
     let source_type = match cast.restore_data() {
-        cast::RestoreData::Output(_) => SOURCE_MONITOR,
+        // workspace casts present as monitor streams
+        cast::RestoreData::Output { .. } | cast::RestoreData::Workspace { .. } => SOURCE_MONITOR,
         cast::RestoreData::Window { .. } => SOURCE_WINDOW,
     };
     b.align(8);
@@ -199,7 +324,8 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                         ("types", SvVal::U(t)) => s.types.set(*t),
                         ("persist_mode", SvVal::U(p)) => s.persist.set(*p),
                         ("restore_token", SvVal::S(t)) => {
-                            *s.restore.borrow_mut() = tokens.borrow().get(t).cloned();
+                            *s.restore.borrow_mut() =
+                                tokens.borrow().get(t).map(|tok| tok.data.clone());
                         }
                         _ => {}
                     }
@@ -243,18 +369,26 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                     } else if let Some(cmd) = &picker_cmd {
                         match picker::pick(&st, cmd, types).await {
                             Some(picker::Choice::Output(name)) => {
-                                cast::Pick::Restored(cast::RestoreData::Output(name))
+                                cast::Pick::Restored(cast::RestoreData::Output { name })
                             }
                             Some(picker::Choice::Window(ident)) => cast::Pick::Ident(ident),
+                            Some(picker::Choice::Workspace(index)) => {
+                                cast::Pick::Restored(cast::RestoreData::Workspace { index })
+                            }
                             None => {
                                 response_to(&me, serial, &dest, R_CANCELLED);
                                 return;
                             }
                         }
-                    } else if types == SOURCE_WINDOW {
-                        cast::Pick::Window
                     } else {
-                        cast::Pick::Monitor
+                        // no picker configured: the next click is the consent
+                        match seat_pick(&st, types).await {
+                            Some(r) => cast::Pick::Restored(r),
+                            None => {
+                                response_to(&me, serial, &dest, R_CANCELLED);
+                                return;
+                            }
+                        }
                     };
                     match cast::start(&st, sess, cursor, pick).await {
                         Ok(cast) => {
@@ -264,7 +398,14 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                                     st.next_uid(),
                                     crate::util::Time::now().nsec()
                                 );
-                                toks.borrow_mut().insert(t.clone(), cast.restore_data());
+                                let disk = persist >= 2;
+                                toks.borrow_mut().insert(
+                                    t.clone(),
+                                    Token { data: cast.restore_data(), disk },
+                                );
+                                if disk {
+                                    save_tokens(&toks.borrow());
+                                }
                                 t
                             });
                             me.reply_to(serial, &dest, "ua{sv}", |b| {
@@ -275,11 +416,9 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                                         b.align(8);
                                         b.put_str("restore_token");
                                         b.put_variant("s", |b| b.put_str(t));
-                                        // granted persistence: this compositor's
-                                        // lifetime, whatever was asked
                                         b.align(8);
                                         b.put_str("persist_mode");
-                                        b.put_variant("u", |b| b.put_u32(1));
+                                        b.put_variant("u", |b| b.put_u32(persist.min(2)));
                                     }
                                 });
                             });
@@ -317,7 +456,7 @@ async fn run_inner(
 ) -> Result<(), DbusError> {
     let conn = DbusConn::connect_session(eng, ring).await?;
     let sessions: Sessions = Rc::new(RefCell::new(HashMap::new()));
-    let tokens: Tokens = Rc::new(RefCell::new(HashMap::new()));
+    let tokens: Tokens = Rc::new(RefCell::new(load_tokens()));
     serve_properties(&conn);
     serve_screencast(&conn, sessions.clone(), tokens, state.clone());
     conn.serve(IF_SESSION, Box::new({
@@ -345,6 +484,41 @@ async fn run_inner(
 pub async fn run(eng: Rc<Engine>, ring: Rc<Ring>, state: Rc<State>) {
     if let Err(e) = run_inner(&eng, &ring, state).await {
         eprintln!("carrot: portal: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_format_round_trips() {
+        let mut m = HashMap::new();
+        m.insert(
+            "carrot:1:2".to_string(),
+            cast::RestoreData::Window { ident: 7, app_id: "foot".into(), title: "~".into() },
+        );
+        m.insert(
+            "carrot:3:4".to_string(),
+            cast::RestoreData::Output { name: "DP-1".into() },
+        );
+        m.insert(
+            "carrot:5:6".to_string(),
+            cast::RestoreData::Workspace { index: 2 },
+        );
+        let text = serde_json::to_string(&m).unwrap();
+        let back: HashMap<String, cast::RestoreData> = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            &back["carrot:1:2"],
+            cast::RestoreData::Window { ident: 7, .. }
+        ));
+        assert!(
+            matches!(&back["carrot:3:4"], cast::RestoreData::Output { name } if name == "DP-1")
+        );
+        assert!(matches!(
+            &back["carrot:5:6"],
+            cast::RestoreData::Workspace { index: 2 }
+        ));
     }
 }
 

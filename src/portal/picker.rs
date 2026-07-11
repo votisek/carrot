@@ -16,6 +16,8 @@ const ANSWER_NS: u64 = 120 * 1_000_000_000;
 pub enum Choice {
     Output(String),
     Window(u64),
+    /// 0-based; the wire ids ("ws:1") are 1-based like the candidate lines
+    Workspace(usize),
 }
 
 pub async fn pick(state: &Rc<State>, cmd: &str, types: u32) -> Option<Choice> {
@@ -85,6 +87,13 @@ fn parse_choice(line: &str) -> Option<Choice> {
     if let Some(id) = line.strip_prefix("w:") {
         return id.parse().ok().map(Choice::Window);
     }
+    if let Some(n) = line.strip_prefix("ws:") {
+        return n
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .map(Choice::Workspace);
+    }
     None
 }
 
@@ -108,6 +117,29 @@ fn candidates(state: &Rc<State>, types: u32) -> String {
                 );
                 out.push('\n');
             }
+        }
+    }
+    if types & super::SOURCE_MONITOR != 0 {
+        // workspace casts present as monitor streams; they are a carrot
+        // extra only the picker can reach
+        let d = state.display.borrow();
+        let outs = d.as_ref().map(|d| d.outputs.borrow().clone()).unwrap_or_default();
+        for (i, ws) in state.workspaces.borrow().iter().enumerate() {
+            let output = outs
+                .get(ws.output.get())
+                .map(|o| o.conn.name.clone())
+                .unwrap_or_default();
+            out.push_str(
+                &json!({
+                    "kind": "workspace",
+                    "id": format!("ws:{}", i + 1),
+                    "index": i + 1,
+                    "output": output,
+                    "active": i == state.active_ws.get(),
+                })
+                .to_string(),
+            );
+            out.push('\n');
         }
     }
     if types & super::SOURCE_WINDOW != 0 {
@@ -141,8 +173,10 @@ mod tests {
     fn choices_parse_and_garbage_cancels() {
         assert!(matches!(parse_choice("o:DP-1"), Some(Choice::Output(n)) if n == "DP-1"));
         assert!(matches!(parse_choice("w:42"), Some(Choice::Window(42))));
+        assert!(matches!(parse_choice("ws:3"), Some(Choice::Workspace(2))));
         assert!(parse_choice("").is_none());
         assert!(parse_choice("w:pigeon").is_none());
+        assert!(parse_choice("ws:0").is_none());
         assert!(parse_choice("everything").is_none());
     }
 }
