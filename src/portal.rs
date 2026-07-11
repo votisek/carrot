@@ -1,14 +1,16 @@
 // the xdg-desktop-portal backend, in-process: carrot claims
 // org.freedesktop.impl.portal.desktop.carrot on the session bus and serves
-// ScreenCast itself - no external backend, no fork. streams start flowing
-// once the pipewire source wiring lands; until then Start answers "ended"
-// so consumers fail clean instead of hanging.
+// ScreenCast itself - no external backend, no fork. Start spins up a
+// pipewire client-node fed from the present tail and replies with its
+// global id once the daemon binds it.
+
+pub mod cast;
 
 use crate::dbus::{DbusConn, DbusError, MethodCall, MsgBuilder};
-use crate::engine::Engine;
+use crate::engine::{Engine, SpawnedFuture};
 use crate::state::State;
 use crate::uring::Ring;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -25,15 +27,33 @@ const VERSION: u32 = 2;
 // portal response codes
 const R_ENDED: u32 = 2;
 
-#[derive(Default)]
 struct Session {
-    cursor_mode: u32,
+    cursor_mode: Cell<u32>,
+    /// the in-flight Start; dropping it cancels the cast setup
+    starting: Cell<Option<SpawnedFuture<()>>>,
+}
+
+impl Default for Session {
+    fn default() -> Session {
+        Session {
+            // the spec default: no pointer in the frames
+            cursor_mode: Cell::new(CURSOR_HIDDEN),
+            starting: Cell::new(None),
+        }
+    }
 }
 
 type Sessions = Rc<RefCell<HashMap<String, Session>>>;
 
 fn reply_response(c: &DbusConn, call: &MethodCall, code: u32) {
     c.reply(call, "ua{sv}", |b| {
+        b.put_u32(code);
+        b.put_array(8, |_| {});
+    });
+}
+
+fn response_to(c: &DbusConn, serial: u32, dest: &str, code: u32) {
+    c.reply_to(serial, dest, "ua{sv}", |b| {
         b.put_u32(code);
         b.put_array(8, |_| {});
     });
@@ -87,7 +107,42 @@ fn serve_properties(conn: &Rc<DbusConn>) {
     }));
 }
 
-fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions) {
+/// the streams a(ua{sv}) result the app receives: node id plus geometry
+fn put_streams(b: &mut MsgBuilder, cast: &cast::Cast) {
+    b.put_u32(0);
+    b.put_array(8, |b| {
+        b.align(8);
+        b.put_str("streams");
+        b.put_variant("a(ua{sv})", |b| {
+            b.put_array(8, |b| {
+                b.align(8);
+                b.put_u32(cast.node_id);
+                b.put_array(8, |b| {
+                    b.align(8);
+                    b.put_str("size");
+                    b.put_variant("(ii)", |b| {
+                        b.align(8);
+                        b.put_i32(cast.width as i32);
+                        b.put_i32(cast.height as i32);
+                    });
+                    b.align(8);
+                    b.put_str("position");
+                    b.put_variant("(ii)", |b| {
+                        b.align(8);
+                        b.put_i32(cast.pos.0);
+                        b.put_i32(cast.pos.1);
+                    });
+                    b.align(8);
+                    b.put_str("source_type");
+                    b.put_variant("u", |b| b.put_u32(SOURCE_MONITOR));
+                });
+            });
+        });
+    });
+}
+
+fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
+    let me = conn.clone();
     conn.serve(IF_SCREENCAST, Box::new(move |c, call| {
         match call.member.as_str() {
             "CreateSession" => {
@@ -109,20 +164,69 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions) {
                 let mut rd = call.rd();
                 let _request = rd.str().unwrap_or_default();
                 let session = rd.str().unwrap_or_default();
-                if !sessions.borrow().contains_key(&session) {
+                let _app = rd.str();
+                let opts = rd.u32_dict().unwrap_or_default();
+                let map = sessions.borrow();
+                let Some(s) = map.get(&session) else {
+                    drop(map);
                     c.reply_err(
                         call,
                         "org.freedesktop.DBus.Error.Failed",
                         "no such session",
                     );
                     return;
+                };
+                if let Some((_, m)) = opts.iter().find(|(k, _)| k == "cursor_mode") {
+                    s.cursor_mode.set(*m);
                 }
+                drop(map);
                 reply_response(c, call, 0);
             }
             "Start" => {
-                // the pipewire stream wiring is not in yet: end the cast
-                // honestly instead of leaving the app waiting
-                reply_response(c, call, R_ENDED);
+                let mut rd = call.rd();
+                let _request = rd.str().unwrap_or_default();
+                let session = rd.str().unwrap_or_default();
+                let cursor = {
+                    let map = sessions.borrow();
+                    let Some(s) = map.get(&session) else {
+                        drop(map);
+                        c.reply_err(
+                            call,
+                            "org.freedesktop.DBus.Error.Failed",
+                            "no such session",
+                        );
+                        return;
+                    };
+                    s.cursor_mode.get() == CURSOR_EMBEDDED
+                };
+                // the node id comes from the daemon; the cast task replies
+                let (serial, dest) = (call.serial, call.sender.clone());
+                let me = me.clone();
+                let st = state.clone();
+                let sess = session.clone();
+                let task = state.eng.spawn("cast start", async move {
+                    match cast::start(&st, sess, cursor).await {
+                        Ok(cast) => me.reply_to(serial, &dest, "ua{sv}", |b| put_streams(b, &cast)),
+                        Err(e) => {
+                            eprintln!("carrot: portal: cast failed: {e}");
+                            response_to(&me, serial, &dest, R_ENDED);
+                        }
+                    }
+                });
+                if let Some(s) = sessions.borrow().get(&session) {
+                    s.starting.set(Some(task));
+                }
+            }
+            "OpenPipeWireRemote" => {
+                // a fresh daemon connection for the app; ours stays control-only
+                match crate::pipewire::open_socket() {
+                    Ok(fd) => c.reply_fds(call, "h", vec![Rc::new(fd)], |b| b.put_u32(0)),
+                    Err(e) => c.reply_err(
+                        call,
+                        "org.freedesktop.DBus.Error.Failed",
+                        &e.to_string(),
+                    ),
+                }
             }
             _ => c.reply_err(call, "org.freedesktop.DBus.Error.UnknownMethod", "no such method"),
         }
@@ -132,17 +236,19 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions) {
 async fn run_inner(
     eng: &Rc<Engine>,
     ring: &Rc<Ring>,
-    _state: Rc<State>,
+    state: Rc<State>,
 ) -> Result<(), DbusError> {
     let conn = DbusConn::connect_session(eng, ring).await?;
     let sessions: Sessions = Rc::new(RefCell::new(HashMap::new()));
     serve_properties(&conn);
-    serve_screencast(&conn, sessions.clone());
+    serve_screencast(&conn, sessions.clone(), state.clone());
     conn.serve(IF_SESSION, Box::new({
         let sessions = sessions.clone();
+        let state = state.clone();
         move |c, call| match call.member.as_str() {
             "Close" => {
                 sessions.borrow_mut().remove(&call.path);
+                state.casts.borrow_mut().retain(|x| x.session != call.path);
                 c.reply(call, "", |_| {});
             }
             _ => c.reply_err(call, "org.freedesktop.DBus.Error.UnknownMethod", "no such method"),

@@ -126,7 +126,7 @@ pub struct DbusConn {
     replies: RefCell<HashMap<u32, Rc<PendingReply>>>,
     signal_handlers: RefCell<Vec<(&'static str, &'static str, SignalCb)>>,
     method_handlers: RefCell<Vec<(&'static str, MethodCb)>>,
-    out: AsyncQueue<Vec<u8>>,
+    out: AsyncQueue<(Vec<u8>, Vec<Rc<OwnedFd>>)>,
     tasks: Cell<Option<(SpawnedFuture<()>, SpawnedFuture<()>)>>,
     pub unique_name: RefCell<String>,
     /// probe-only byte transcript
@@ -249,14 +249,45 @@ impl DbusConn {
     }
 
     pub fn reply(&self, call: &MethodCall, sig: &str, f: impl FnOnce(&mut wire::MsgBuilder)) {
+        self.reply_to(call.serial, &call.sender, sig, f);
+    }
+
+    /// reply by saved (serial, sender): Start answers from its cast task,
+    /// long after the handler returned
+    pub fn reply_to(
+        &self,
+        reply_serial: u32,
+        dest: &str,
+        sig: &str,
+        f: impl FnOnce(&mut wire::MsgBuilder),
+    ) {
         let serial = self.next_serial();
-        let mut b = wire::MsgBuilder::method_return(serial, call.serial, &call.sender);
+        let mut b = wire::MsgBuilder::method_return(serial, reply_serial, dest);
         if !sig.is_empty() {
             b.signature(sig);
         }
         b.finish_header();
         f(&mut b);
-        self.out.push(b.finish());
+        self.out.push((b.finish(), Vec::new()));
+    }
+
+    /// a reply carrying fds; "h" values in the body index into the fd array
+    pub fn reply_fds(
+        &self,
+        call: &MethodCall,
+        sig: &str,
+        fds: Vec<Rc<OwnedFd>>,
+        f: impl FnOnce(&mut wire::MsgBuilder),
+    ) {
+        let serial = self.next_serial();
+        let mut b = wire::MsgBuilder::method_return(serial, call.serial, &call.sender);
+        if !sig.is_empty() {
+            b.signature(sig);
+        }
+        b.unix_fds(fds.len() as u32);
+        b.finish_header();
+        f(&mut b);
+        self.out.push((b.finish(), fds));
     }
 
     pub fn reply_err(&self, call: &MethodCall, name: &str, text: &str) {
@@ -265,7 +296,7 @@ impl DbusConn {
         b.signature("s");
         b.finish_header();
         b.put_str(text);
-        self.out.push(b.finish());
+        self.out.push((b.finish(), Vec::new()));
     }
 
     /// claim a well-known name; 4 = DBUS_NAME_FLAG_DO_NOT_QUEUE
@@ -343,7 +374,7 @@ impl DbusConn {
         });
         self.replies.borrow_mut().insert(serial, pending.clone());
         self.out
-            .push(self.build(serial, 0, dest, path, iface, member, sig, args));
+            .push((self.build(serial, 0, dest, path, iface, member, sig, args), Vec::new()));
         pending.done.triggered().await;
         pending.result.take().unwrap_or(Err(DbusError::Closed))
     }
@@ -361,15 +392,18 @@ impl DbusConn {
             return;
         }
         let serial = self.next_serial();
-        self.out.push(self.build(
-            serial,
-            wire::NO_REPLY_EXPECTED,
-            dest,
-            path,
-            iface,
-            member,
-            sig,
-            args,
+        self.out.push((
+            self.build(
+                serial,
+                wire::NO_REPLY_EXPECTED,
+                dest,
+                path,
+                iface,
+                member,
+                sig,
+                args,
+            ),
+            Vec::new(),
         ));
     }
 
@@ -553,15 +587,16 @@ impl DbusConn {
 
     async fn outgoing_loop(&self) -> Result<(), DbusError> {
         loop {
-            let msg = self.out.pop().await;
-            self.dump_line(&format!("TX {} {}", msg.len(), hex(&msg)));
+            let (msg, mut fds) = self.out.pop().await;
+            self.dump_line(&format!("TX {} fds={} {}", msg.len(), fds.len(), hex(&msg)));
             let len = msg.len();
             let mut sent = 0;
             let mut buf = msg;
             while sent < len {
+                // fds attach to the first byte
                 let (b, n) = self
                     .ring
-                    .sendmsg(&self.fd, buf, (sent, len), Vec::new(), None)
+                    .sendmsg(&self.fd, buf, (sent, len), std::mem::take(&mut fds), None)
                     .await?;
                 buf = b;
                 sent += n;

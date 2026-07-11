@@ -63,6 +63,11 @@ impl MsgBuilder {
         b
     }
 
+    /// fds ride out of band; the header carries only their count
+    pub fn unix_fds(&mut self, n: u32) {
+        self.field_u32(F_UNIX_FDS, n);
+    }
+
     fn field_u32(&mut self, code: u8, value: u32) {
         self.pad(8);
         self.buf.push(code);
@@ -123,6 +128,11 @@ impl MsgBuilder {
     // -- body writers; only what logind speaks --
 
     pub fn put_u32(&mut self, v: u32) {
+        self.pad(4);
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    pub fn put_i32(&mut self, v: i32) {
         self.pad(4);
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
@@ -349,6 +359,28 @@ impl<'a> Rd<'a> {
             .ok_or(DbusError::Malformed("fd index out of range"))
     }
 
+    /// the u32-valued entries of an a{sv}; everything else is skipped
+    pub fn u32_dict(&mut self) -> Result<Vec<(String, u32)>, DbusError> {
+        let len = self.u32()? as usize;
+        self.align(8)?;
+        let end = self.pos + len;
+        if end > self.buf.len() {
+            return Err(DbusError::Malformed("dict past end"));
+        }
+        let mut out = Vec::new();
+        while self.pos < end {
+            self.align(8)?;
+            let key = self.str()?;
+            let sig = self.sig()?;
+            if sig == "u" {
+                out.push((key, self.u32()?));
+            } else {
+                self.skip_value(&sig)?;
+            }
+        }
+        Ok(out)
+    }
+
     /// generic skip for header fields we don't care about
     pub fn skip_value(&mut self, sig: &str) -> Result<(), DbusError> {
         match sig.as_bytes().first() {
@@ -454,5 +486,78 @@ mod tests {
         let msg = build_take_device(3, 1, 2);
         assert_eq!(message_len(&msg[..8]), None);
         assert_eq!(message_len(&msg[..16]), Some(msg.len()));
+    }
+
+    #[test]
+    fn u32_dict_reads_what_the_builder_wrote() {
+        let mut b = MsgBuilder::call(1, 0);
+        b.path("/x");
+        b.destination("d");
+        b.interface("i");
+        b.member("m");
+        b.signature("a{sv}");
+        b.finish_header();
+        b.put_array(8, |b| {
+            b.align(8);
+            b.put_str("cursor_mode");
+            b.put_variant("u", |b| b.put_u32(2));
+            b.align(8);
+            b.put_str("restore_token");
+            b.put_variant("s", |b| b.put_str("tok"));
+            b.align(8);
+            b.put_str("types");
+            b.put_variant("u", |b| b.put_u32(1));
+        });
+        let msg = b.finish();
+        let h = parse(&msg).unwrap();
+        let mut r = Rd::new(&msg[h.body.0..h.body.1], &[]);
+        let d = r.u32_dict().unwrap();
+        assert_eq!(d, vec![("cursor_mode".into(), 2), ("types".into(), 1)]);
+    }
+
+    #[test]
+    fn streams_reply_shape_walks_back() {
+        let mut b = MsgBuilder::method_return(2, 1, ":1.7");
+        b.signature("ua{sv}");
+        b.finish_header();
+        b.put_u32(0);
+        b.put_array(8, |b| {
+            b.align(8);
+            b.put_str("streams");
+            b.put_variant("a(ua{sv})", |b| {
+                b.put_array(8, |b| {
+                    b.align(8);
+                    b.put_u32(42);
+                    b.put_array(8, |b| {
+                        b.align(8);
+                        b.put_str("size");
+                        b.put_variant("(ii)", |b| {
+                            b.align(8);
+                            b.put_i32(1920);
+                            b.put_i32(1080);
+                        });
+                    });
+                });
+            });
+        });
+        let msg = b.finish();
+        let h = parse(&msg).unwrap();
+        assert_eq!(h.signature, "ua{sv}");
+        let mut r = Rd::new(&msg[h.body.0..h.body.1], &[]);
+        assert_eq!(r.u32().unwrap(), 0); // response code
+        let _results = r.u32().unwrap(); // results dict byte length
+        r.align(8).unwrap();
+        assert_eq!(r.str().unwrap(), "streams");
+        assert_eq!(r.sig().unwrap(), "a(ua{sv})");
+        let _streams = r.u32().unwrap(); // array byte length
+        r.align(8).unwrap();
+        assert_eq!(r.u32().unwrap(), 42); // node id
+        let _props = r.u32().unwrap();
+        r.align(8).unwrap();
+        assert_eq!(r.str().unwrap(), "size");
+        assert_eq!(r.sig().unwrap(), "(ii)");
+        r.align(8).unwrap();
+        assert_eq!(r.u32().unwrap(), 1920);
+        assert_eq!(r.u32().unwrap(), 1080);
     }
 }

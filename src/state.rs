@@ -50,6 +50,8 @@ pub struct State {
         RefCell<Vec<Rc<crate::protocol::foreign_toplevel_list::ExtToplevelList>>>,
     /// live image-copy-capture sessions, serviced from present/commit
     pub icc_sessions: RefCell<Vec<Rc<crate::protocol::image_copy_capture::IccSession>>>,
+    /// live portal screencasts, fed from the present tail
+    pub casts: RefCell<Vec<Rc<crate::portal::cast::Cast>>>,
     /// idle notifications + inhibitors; the pump task ticks deadlines
     pub idle: crate::protocol::idle::IdleState,
     /// the session lock; survives its client (a dead locker must not unlock)
@@ -97,6 +99,7 @@ impl State {
             ftl_managers: RefCell::new(Vec::new()),
             ext_toplevel_lists: RefCell::new(Vec::new()),
             icc_sessions: RefCell::new(Vec::new()),
+            casts: RefCell::new(Vec::new()),
             idle: Default::default(),
             lock: RefCell::new(None),
             dpms_off: std::cell::Cell::new(false),

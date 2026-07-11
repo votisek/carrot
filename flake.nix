@@ -80,13 +80,14 @@
           carrot = craneLib.buildPackage (commonArgs // {
             cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-            # TODO: portal config, etc
             postInstall = ''
               wrapProgram $out/bin/carrot \
                 --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.vulkan-loader ]} \
                 --set-default XKB_CONFIG_ROOT ${pkgs.xkeyboard-config}/share/X11/xkb
 
-              # Wayland session desktop entry
+              # Wayland session desktop entry; DesktopNames makes the session
+              # manager set XDG_CURRENT_DESKTOP=carrot, which the portal
+              # frontend matches against carrot-portals.conf
               mkdir -p $out/share/wayland-sessions
               cat > $out/share/wayland-sessions/carrot.desktop << EOF
               [Desktop Entry]
@@ -94,6 +95,22 @@
               Comment=A pure Rust tiling Wayland compositor
               Exec=$out/bin/carrot
               Type=Application
+              DesktopNames=carrot
+              EOF
+
+              # the portal backend is the compositor itself - register the
+              # bus name it serves and prefer it for screencasts
+              mkdir -p $out/share/xdg-desktop-portal/portals
+              cat > $out/share/xdg-desktop-portal/portals/carrot.portal << EOF
+              [portal]
+              DBusName=org.freedesktop.impl.portal.desktop.carrot
+              Interfaces=org.freedesktop.impl.portal.ScreenCast
+              UseIn=carrot
+              EOF
+              cat > $out/share/xdg-desktop-portal/carrot-portals.conf << EOF
+              [preferred]
+              default=*
+              org.freedesktop.impl.portal.ScreenCast=carrot
               EOF
             '';
 

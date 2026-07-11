@@ -180,7 +180,7 @@ pub struct SourceNode {
 }
 
 impl SourceNode {
-    pub fn create(con: Rc<PwConn>, proxy_id: u32, width: u32, height: u32, fps: u32) -> Result<SourceNode, PwError> {
+    pub async fn create(con: Rc<PwConn>, proxy_id: u32, width: u32, height: u32, fps: u32) -> Result<SourceNode, PwError> {
         let mut b = PodBuilder::default();
         b.struct_(|b| {
             b.string("client-node");
@@ -196,7 +196,7 @@ impl SourceNode {
             ]);
             b.uint(proxy_id);
         });
-        con.send(0, super::CORE_CREATE_OBJECT, &b.buf)?;
+        con.send(0, super::CORE_CREATE_OBJECT, &b.buf).await?;
         let node = SourceNode {
             con,
             proxy_id,
@@ -213,13 +213,13 @@ impl SourceNode {
             format_set: false,
             seq: 0,
         };
-        node.send_update()?;
-        node.send_port_update()?;
-        node.set_active(true)?;
+        node.send_update().await?;
+        node.send_port_update().await?;
+        node.set_active(true).await?;
         Ok(node)
     }
 
-    fn send_update(&self) -> Result<(), PwError> {
+    async fn send_update(&self) -> Result<(), PwError> {
         let mut b = PodBuilder::default();
         b.struct_(|b| {
             b.uint(UPDATE_INFO);
@@ -233,11 +233,11 @@ impl SourceNode {
                 b.uint(0); // params
             });
         });
-        self.con.send(self.proxy_id, CN_UPDATE, &b.buf)
+        self.con.send(self.proxy_id, CN_UPDATE, &b.buf).await
     }
 
     /// one output port: a single fixed memfd format, header meta, buffers
-    fn send_port_update(&self) -> Result<(), PwError> {
+    async fn send_port_update(&self) -> Result<(), PwError> {
         let (w, h, fps) = (self.width, self.height, self.fps);
         let mut b = PodBuilder::default();
         b.struct_(|b| {
@@ -280,13 +280,13 @@ impl SourceNode {
                 b.uint(PARAM_INFO_READ);
             });
         });
-        self.con.send(self.proxy_id, CN_PORT_UPDATE, &b.buf)
+        self.con.send(self.proxy_id, CN_PORT_UPDATE, &b.buf).await
     }
 
-    fn set_active(&self, active: bool) -> Result<(), PwError> {
+    async fn set_active(&self, active: bool) -> Result<(), PwError> {
         let mut b = PodBuilder::default();
         b.struct_(|b| b.bool_(active));
-        self.con.send(self.proxy_id, CN_SET_ACTIVE, &b.buf)
+        self.con.send(self.proxy_id, CN_SET_ACTIVE, &b.buf).await
     }
 
     /// core + node event dispatch; unhandled frames return false
@@ -483,11 +483,11 @@ impl SourceNode {
         self.io.is_some() && !self.buffers.is_empty() && self.format_set
     }
 
-    /// fill the next buffer with the moving test pattern and hand it to the
-    /// graph: chunk, header, io status, then every peer's eventfd
-    pub fn produce(&mut self, tick: u64) -> Result<(), PwError> {
+    /// hand the next buffer to the graph: `fill` paints the pixels, then
+    /// chunk, header, io status, and every peer's activation eventfd
+    pub fn produce(&mut self, fill: impl FnOnce(&mut [u8], usize)) {
         use std::sync::atomic::{AtomicU32, Ordering};
-        let Some((_, io)) = &self.io else { return Ok(()) };
+        let Some((_, io)) = &self.io else { return };
         let io = *io;
         let cur = unsafe { (*(io.add(4) as *const AtomicU32)).load(Ordering::Relaxed) };
         let idx = ((cur.wrapping_add(1)) as usize) % self.buffers.len();
@@ -496,18 +496,7 @@ impl SourceNode {
         let stride = w * 4;
         let len = (stride * h).min(b.data_len);
         let px = unsafe { std::slice::from_raw_parts_mut(b.data, len) };
-        let bar = (tick as usize * 4) % w;
-        for y in 0..h.min(len / stride) {
-            let row = &mut px[y * stride..(y + 1) * stride];
-            for x in 0..w {
-                let o = x * 4;
-                let on = x >= bar && x < bar + w / 8;
-                row[o] = if on { 40 } else { (x * 255 / w) as u8 }; // b
-                row[o + 1] = if on { 220 } else { (y * 255 / h) as u8 }; // g
-                row[o + 2] = if on { 120 } else { 60 }; // r
-                row[o + 3] = 255;
-            }
-        }
+        fill(px, stride);
         unsafe {
             // spa_chunk: offset, size, stride, flags
             let c = b.chunk as *mut u32;
@@ -545,6 +534,5 @@ impl SourceNode {
                 }
             }
         }
-        Ok(())
     }
 }

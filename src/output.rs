@@ -1559,6 +1559,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         // captures complete against the frame just shown
         crate::protocol::image_copy_capture::output_presented(state, &out.conn.name);
         crate::protocol::session_lock::output_presented(state, &out.conn.name);
+        crate::portal::cast::output_presented(state, &out.conn.name);
     }
 }
 
