@@ -1513,7 +1513,15 @@ impl SeatGlobal {
                 win.configure_rect();
             }
             Op::Ratio(_, edges, dx, dy) => {
-                if !crate::tree::dwindle::resize_by_edges(&win, edges, dx, dy) {
+                let hit = match ws.tiling.mode() {
+                    crate::config::LayoutMode::Dwindle => {
+                        crate::tree::dwindle::resize_by_edges(&win, edges, dx, dy)
+                    }
+                    crate::config::LayoutMode::Scrolling => {
+                        ws.tiling.strip.resize_by_edges(&win, edges, dx, dy)
+                    }
+                };
+                if !hit {
                     return;
                 }
             }

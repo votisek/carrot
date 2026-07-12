@@ -666,6 +666,19 @@ pub fn focus_dir(state: &Rc<State>, dir: Dir) {
         return;
     };
     let ws = workspace_of(state, &cur).unwrap_or_else(|| active(state));
+    if ws.tiling.mode() == crate::config::LayoutMode::Scrolling
+        && !cur.floating.get()
+        && !cur.fullscreen.get()
+    {
+        ws.tiling.strip.note_focus(&cur);
+        if let Some(next) = ws.tiling.strip.focus_dir(dir) {
+            // keep-in-view follows the newly active column
+            relayout(state, &ws);
+            focus_window(state, Some(&next));
+            state.damage.trigger();
+        }
+        return;
+    }
     let mut cands = Vec::new();
     ws.for_each(|w| {
         if !Rc::ptr_eq(w, &cur) {
@@ -688,6 +701,14 @@ pub fn swap_dir(state: &Rc<State>, dir: Dir) {
         return;
     }
     let ws = workspace_of(state, &cur).unwrap_or_else(|| active(state));
+    if ws.tiling.mode() == crate::config::LayoutMode::Scrolling {
+        ws.tiling.strip.note_focus(&cur);
+        if ws.tiling.strip.swap_dir(&cur, dir) {
+            relayout(state, &ws);
+            state.damage.trigger();
+        }
+        return;
+    }
     let mut cands = Vec::new();
     ws.tiling.for_each(|w| {
         if !Rc::ptr_eq(w, &cur) {

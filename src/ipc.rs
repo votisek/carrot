@@ -187,14 +187,21 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
         Action::SwapDir(d) => crate::tree::swap_dir(state, *d),
         Action::AdjustSplitRatio(d) => {
             if let Some(win) = crate::tree::focused_window(state) {
-                if !win.floating.get()
-                    && !win.fullscreen.get()
-                    && crate::tree::dwindle::adjust_parent_ratio(&win, *d)
-                {
+                if !win.floating.get() && !win.fullscreen.get() {
                     let ws = crate::tree::workspace_of(state, &win)
                         .unwrap_or_else(|| crate::tree::active(state));
-                    crate::tree::relayout(state, &ws);
-                    state.damage.trigger();
+                    let hit = match ws.tiling.mode() {
+                        crate::config::LayoutMode::Dwindle => {
+                            crate::tree::dwindle::adjust_parent_ratio(&win, *d)
+                        }
+                        crate::config::LayoutMode::Scrolling => {
+                            ws.tiling.strip.adjust_width(&win, *d)
+                        }
+                    };
+                    if hit {
+                        crate::tree::relayout(state, &ws);
+                        state.damage.trigger();
+                    }
                 }
             }
         }
