@@ -144,7 +144,7 @@ pub struct Window {
     pub kind: WindowKind,
     /// stable identity for the window's lifetime; uids never get reused
     pub ident: u64,
-    /// assigned box, gaps/border applied
+    /// assigned box, gaps/border applied - the TARGET; animations chase it
     pub rect: Cell<Rect>,
     pub node: RefCell<Weak<dwindle::Node>>,
     pub floating: Cell<bool>,
@@ -153,6 +153,29 @@ pub struct Window {
     pub rule_immediate: Cell<bool>,
     /// window-rule `opacity`, multiplied into every sampled quad
     pub rule_opacity: Cell<Option<f32>>,
+    pub anims: RefCell<WinAnims>,
+}
+
+// -- window animations: the visuals chasing the target rect --
+
+#[derive(Default)]
+pub struct WinAnims {
+    pub move_: Option<MoveAnim>,
+    pub open: Option<(crate::anim::Anim, crate::config::Style)>,
+    pub border: Option<BorderAnim>,
+}
+
+/// draw offset = (dx, dy) * anim.value(); the anim runs 1 -> 0
+pub struct MoveAnim {
+    pub dx: f64,
+    pub dy: f64,
+    pub anim: crate::anim::Anim,
+}
+
+pub struct BorderAnim {
+    pub from: [f32; 4],
+    pub to: [f32; 4],
+    pub anim: crate::anim::Anim,
 }
 
 impl Window {
@@ -166,6 +189,7 @@ impl Window {
             fullscreen: Cell::new(false),
             rule_immediate: Cell::new(false),
             rule_opacity: Cell::new(None),
+            anims: RefCell::new(WinAnims::default()),
         }
     }
 
@@ -236,6 +260,77 @@ impl Window {
         } else {
             self.rect.get()
         }
+    }
+
+    /// target rect write + move-anim bookkeeping; every layout path uses this
+    pub fn set_rect_animated(&self, state: &State, r: Rect) {
+        let old = self.rect.replace(r);
+        if old == r {
+            return;
+        }
+        let first = old == Rect::default();
+        let (dx, dy) = ((old.x1 - r.x1) as f64, (old.y1 - r.y1) as f64);
+        if first || (dx == 0.0 && dy == 0.0) || self.fullscreen.get() {
+            return;
+        }
+        let cfg = state.config.borrow().clone();
+        let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowMove) else {
+            self.anims.borrow_mut().move_ = None;
+            return;
+        };
+        let now = state.anim_clock.now();
+        let mut anims = self.anims.borrow_mut();
+        // retarget folds the current visual offset into the new from-delta
+        let (cdx, cdy, vel) = match &anims.move_ {
+            Some(m) => {
+                let v = m.anim.value(now);
+                (m.dx * v + dx, m.dy * v + dy, m.anim.velocity(now))
+            }
+            None => (dx, dy, 0.0),
+        };
+        anims.move_ = Some(MoveAnim {
+            dx: cdx,
+            dy: cdy,
+            anim: crate::config::build_anim(&state.anim_clock, motion, &cfg.animations, 1.0, 0.0, vel),
+        });
+    }
+
+    /// where this window paints THIS frame: the target plus animated offset
+    pub fn visual_rect(&self, state: &State) -> Rect {
+        let base = self.draw_rect(state);
+        let m = self.anims.borrow();
+        match &m.move_ {
+            Some(mv) => {
+                let v = mv.anim.value(state.anim_clock.now());
+                base.move_((mv.dx * v).round() as i32, (mv.dy * v).round() as i32)
+            }
+            None => base,
+        }
+    }
+
+    /// prune finished animations, report whether any remain
+    pub fn anims_live(&self, now: u64) -> bool {
+        let mut m = self.anims.borrow_mut();
+        if m.move_.as_ref().is_some_and(|mv| mv.anim.is_done(now)) {
+            m.move_ = None;
+        }
+        if m.open.as_ref().is_some_and(|(a, _)| a.is_done(now)) {
+            m.open = None;
+        }
+        if m.border.as_ref().is_some_and(|b| b.anim.is_done(now)) {
+            m.border = None;
+        }
+        m.move_.is_some() || m.open.is_some() || m.border.is_some()
+    }
+
+    /// drop every animation; grabs and no-anim paths stay 1:1
+    pub fn anims_snap(&self) {
+        *self.anims.borrow_mut() = WinAnims::default();
+    }
+
+    /// drop only the move animation; a grab must not chase its own pointer
+    pub fn move_snap(&self) {
+        self.anims.borrow_mut().move_ = None;
     }
 
     pub fn configure_rect(&self) {
@@ -623,7 +718,7 @@ fn float_into(
     } else {
         (sw / 4, sh / 4)
     };
-    win.rect.set(Rect::new_sized_saturating(x, y, w, h));
+    win.set_rect_animated(state, Rect::new_sized_saturating(x, y, w, h));
     ws.floats.borrow_mut().push(win.clone());
     win.configure_rect();
     relayout(state, ws);
@@ -784,7 +879,7 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
             .upgrade()
             .map(|n| n.rect.get())
             .unwrap_or_default();
-        win.rect.set(apply_gaps(raw, area, &cfg));
+        win.set_rect_animated(state, apply_gaps(raw, area, &cfg));
         if !win.fullscreen.get() {
             win.configure_rect();
         }
@@ -968,6 +1063,29 @@ fn layer_popups_hit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_anim_offsets_visual_rect() {
+        let (state, client) = crate::client::test_utils::test_client();
+        let base = crate::shell::xdg::tests::mk_base(&client, 90);
+        let (_s, _xdg, tl) = crate::shell::xdg::tests::mk_toplevel(&client, &base, 91, 92, 93);
+        let win = Rc::new(Window::new(&state, WindowKind::Xdg(tl)));
+        state.anim_clock.freeze(0);
+        win.set_rect_animated(&state, Rect::new_sized_saturating(0, 0, 100, 100));
+        // first placement never animates - there is no previous rect
+        assert!(win.anims.borrow().move_.is_none());
+        win.set_rect_animated(&state, Rect::new_sized_saturating(200, 0, 100, 100));
+        assert!(win.anims.borrow().move_.is_some());
+        // mid-flight the visual sits between the old and new x
+        state.anim_clock.freeze(30_000_000);
+        let vr = win.visual_rect(&state);
+        assert!(vr.x1 > 0 && vr.x1 < 200, "got x1={}", vr.x1);
+        // far future: settled on the target, and the anim prunes away
+        state.anim_clock.freeze(10_000_000_000);
+        assert_eq!(win.visual_rect(&state).x1, 200);
+        assert!(!win.anims_live(state.anim_clock.now()));
+        assert!(win.anims.borrow().move_.is_none());
+    }
 
     #[test]
     fn relative_workspace_wraps_both_ways() {

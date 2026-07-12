@@ -1868,7 +1868,10 @@ fn compose_ops(
         if !surface.mapped.get() {
             return;
         }
-        let rect = win.draw_rect(state);
+        let rect = win.visual_rect(state);
+        if win.anims_live(state.anim_clock.now()) {
+            out.anim_pending.set(true);
+        }
         if !win.fullscreen.get() {
             let color = match &focused {
                 Some(f) => {

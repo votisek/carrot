@@ -16,8 +16,10 @@ pub fn toggle_floating(state: &Rc<State>, win: &Rc<Window>) {
         win.floating.set(true);
         let (sw, sh) = super::output_extent(state);
         let (w, h) = (sw / 2, sh / 2);
-        win.rect
-            .set(Rect::new_sized_saturating(sw / 4, sh / 4, w.max(1), h.max(1)));
+        win.set_rect_animated(
+            state,
+            Rect::new_sized_saturating(sw / 4, sh / 4, w.max(1), h.max(1)),
+        );
         ws.floats.borrow_mut().push(win.clone());
         win.configure_rect();
     } else {

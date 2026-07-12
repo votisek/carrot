@@ -1509,6 +1509,7 @@ impl SeatGlobal {
         match op {
             Op::SetRect(_, r) => {
                 win.rect.set(r);
+                win.move_snap();
                 win.configure_rect();
             }
             Op::Ratio(_, edges, dx, dy) => {
@@ -1518,6 +1519,9 @@ impl SeatGlobal {
             }
         }
         crate::tree::relayout(state, &ws);
+        // a live drag relayouts per motion event; chasing that target would
+        // rubber-band the whole workspace behind the pointer
+        ws.tiling.for_each(|w| w.move_snap());
         state.damage.trigger();
     }
 
