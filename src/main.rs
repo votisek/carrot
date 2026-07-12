@@ -4,6 +4,7 @@
 extern crate eyra;
 
 // core runtime
+mod anim;
 mod cpu_worker;
 mod engine;
 mod rect;
