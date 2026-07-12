@@ -51,6 +51,12 @@ pub enum Action {
     ToggleFullWidth,
     CenterColumn,
     SetLayout(SetLayoutArg),
+    /// grab the window under the cursor and let the pointer carry it;
+    /// bound to a mouse chord it drags, bound to a key it sticks until
+    /// the next click
+    PointerMove,
+    /// same grab, resizing by the quadrant the pointer started in
+    PointerResize,
     Spawn(Vec<String>),
     SpawnSh(String),
     Quit,
@@ -634,6 +640,36 @@ pub fn load() -> Loaded {
                 eprintln!("carrot: config: {e}");
             }
             Loaded::Fallback { errors }
+        }
+    }
+}
+
+/// `carrot check-config [path]`: parse and report without a session.
+/// exit 0 clean, 1 broken
+pub fn check(path: Option<&str>) -> i32 {
+    let path = path.map(std::path::PathBuf::from).unwrap_or_else(config_path);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("carrot: {}: {e}", path.display());
+            return 1;
+        }
+    };
+    let parsed = if path.extension().is_some_and(|e| e == "lua") {
+        lua::parse(&text)
+    } else {
+        parse(&text)
+    };
+    match parsed {
+        Ok(_) => {
+            println!("{}: ok", path.display());
+            0
+        }
+        Err(errors) => {
+            for e in errors {
+                eprintln!("{}: {e}", path.display());
+            }
+            1
         }
     }
 }

@@ -116,6 +116,10 @@ fn main() {
     if std::env::args().any(|a| a == "portal-probe") {
         std::process::exit(portal::probe());
     }
+    if let Some(i) = std::env::args().position(|a| a == "check-config") {
+        let path = std::env::args().nth(i + 1);
+        std::process::exit(config::check(path.as_deref()));
+    }
 
     if let Err(e) = run() {
         eprintln!("carrot: fatal: {e}");

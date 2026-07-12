@@ -215,6 +215,14 @@ fn action(node: &KdlNode, cx: &mut Cx) -> Option<Action> {
             none(cx, name);
             Action::CenterColumn
         }
+        "pointer-move" => {
+            none(cx, name);
+            Action::PointerMove
+        }
+        "pointer-resize" => {
+            none(cx, name);
+            Action::PointerResize
+        }
         "set-layout" => match strs.first().map(String::as_str) {
             Some("dwindle") => Action::SetLayout(SetLayoutArg::Dwindle),
             Some("scrolling") => Action::SetLayout(SetLayoutArg::Scrolling),
@@ -260,6 +268,8 @@ mod tests {
              Mod+W { toggle-full-width; }\n\
              Mod+C { center-column; }\n\
              Mod+T { set-layout \"toggle\"; }\n\
+             Mod+X { pointer-move; }\n\
+             Mod+MouseRight { pointer-resize; }\n\
              }",
         );
         let acts: Vec<_> = c.binds.iter().map(|b| b.action.clone()).collect();
@@ -269,6 +279,11 @@ mod tests {
         assert!(acts.contains(&Action::ToggleFullWidth));
         assert!(acts.contains(&Action::CenterColumn));
         assert!(acts.contains(&Action::SetLayout(SetLayoutArg::Toggle)));
+        assert!(acts.contains(&Action::PointerMove));
+        assert!(acts.contains(&Action::PointerResize));
+        // the mouse chord landed on the right code space
+        let pr = c.binds.iter().find(|b| b.action == Action::PointerResize).unwrap();
+        assert_eq!(pr.key, 273, "MouseRight is BTN_RIGHT");
         let errs = parse_errs("binds { Mod+T { set-layout \"spiral\"; } }");
         assert!(errs.iter().any(|e| e.contains("set-layout")), "{errs:?}");
     }

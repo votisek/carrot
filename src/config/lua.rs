@@ -793,6 +793,8 @@ fn action_from(name: &str, args: &[LuaArg]) -> Result<Action, String> {
         "cycle-column-width-back" => Action::CycleColumnWidthBack,
         "toggle-full-width" => Action::ToggleFullWidth,
         "center-column" => Action::CenterColumn,
+        "pointer-move" => Action::PointerMove,
+        "pointer-resize" => Action::PointerResize,
         "set-layout" => match args.first() {
             Some(LuaArg::S(s)) => match s.as_str() {
                 "dwindle" => Action::SetLayout(SetLayoutArg::Dwindle),
