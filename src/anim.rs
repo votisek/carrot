@@ -129,17 +129,214 @@ pub(crate) fn spring_duration(k: &SpringK, x0: f64, v0: f64) -> f64 {
 }
 
 pub(crate) fn spring_clamped(k: &SpringK, x0: f64, v0: f64) -> f64 {
-    // first touch of the target: millisecond stepping, capped at 3s
+    // first touch of the target: millisecond stepping, capped at 3s. a
+    // sign flip between grid points is a touch too - the crossing itself
+    // can dodge the epsilon band entirely
     let dur = spring_duration(k, x0, v0);
     let eps = k.epsilon.clamp(1e-7, 0.5) * x0.abs().max(1e-9);
     let mut t = 0.0;
+    let mut prev = x0;
     while t < dur.min(3.0) {
-        if spring_pos(k, x0, v0, t).abs() <= eps {
+        let pos = spring_pos(k, x0, v0, t);
+        if pos.abs() <= eps || pos.signum() != prev.signum() {
             return t;
         }
+        prev = pos;
         t += 0.001;
     }
     dur.min(3.0)
+}
+
+use std::cell::Cell;
+
+pub struct AnimClock {
+    now_ns: Cell<u64>,
+    off: Cell<bool>,
+    slowdown: Cell<f64>,
+}
+
+impl AnimClock {
+    pub fn new() -> AnimClock {
+        AnimClock {
+            now_ns: Cell::new(0),
+            off: Cell::new(false),
+            slowdown: Cell::new(1.0),
+        }
+    }
+    pub fn freeze(&self, ns: u64) {
+        self.now_ns.set(ns);
+    }
+    pub fn now(&self) -> u64 {
+        self.now_ns.get()
+    }
+    pub fn set_global(&self, off: bool, slowdown: f64) {
+        self.off.set(off);
+        self.slowdown.set(slowdown.clamp(0.001, 100.0));
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Kind {
+    Ease(Curve),
+    Spring(SpringK, f64), // params, v0
+}
+
+#[derive(Clone, Debug)]
+pub struct Anim {
+    from: f64,
+    to: f64,
+    start: u64,
+    dur_ns: u64,
+    clamped_ns: u64,
+    scale: f64, // 1/slowdown, captured at construction
+    kind: Kind,
+}
+
+impl Anim {
+    pub fn ease(clock: &AnimClock, from: f64, to: f64, ms: u32, curve: Curve) -> Anim {
+        let dur = if clock.off.get() { 0 } else { ms as u64 * 1_000_000 };
+        Anim {
+            from,
+            to,
+            start: clock.now(),
+            dur_ns: dur,
+            clamped_ns: dur,
+            scale: 1.0 / clock.slowdown.get(),
+            kind: Kind::Ease(curve),
+        }
+    }
+
+    pub fn spring(clock: &AnimClock, from: f64, to: f64, v0: f64, k: SpringK) -> Anim {
+        let x0 = from - to;
+        let (dur, clamped) = if clock.off.get() || x0 == 0.0 {
+            (0.0, 0.0)
+        } else {
+            (spring_duration(&k, x0, v0), spring_clamped(&k, x0, v0))
+        };
+        Anim {
+            from,
+            to,
+            start: clock.now(),
+            dur_ns: (dur * 1e9) as u64,
+            clamped_ns: (clamped * 1e9) as u64,
+            scale: 1.0 / clock.slowdown.get(),
+            kind: Kind::Spring(k, v0),
+        }
+    }
+
+    pub fn to(&self) -> f64 {
+        self.to
+    }
+
+    fn elapsed_ns(&self, now: u64) -> u64 {
+        (now.saturating_sub(self.start) as f64 * self.scale) as u64
+    }
+
+    pub fn is_done(&self, now: u64) -> bool {
+        self.elapsed_ns(now) >= self.dur_ns
+    }
+
+    pub fn value(&self, now: u64) -> f64 {
+        let el = self.elapsed_ns(now);
+        if el >= self.dur_ns {
+            return self.to;
+        }
+        match &self.kind {
+            Kind::Ease(c) => {
+                let x = el as f64 / self.dur_ns.max(1) as f64;
+                self.from + (self.to - self.from) * c.y(x)
+            }
+            Kind::Spring(k, v0) => {
+                let t = el as f64 / 1e9;
+                let v = self.to + spring_pos(k, self.from - self.to, *v0, t);
+                // numerical guard: never fly further than 10x the range
+                let r = (self.to - self.from).abs().max(1e-9) * 10.0;
+                v.clamp(self.from.min(self.to) - r, self.from.max(self.to) + r)
+            }
+        }
+    }
+
+    pub fn clamped_value(&self, now: u64) -> f64 {
+        if self.elapsed_ns(now) >= self.clamped_ns {
+            self.to
+        } else {
+            self.value(now)
+        }
+    }
+
+    pub fn offset(&mut self, d: f64) {
+        self.from += d;
+        self.to += d;
+    }
+
+    /// units per second, finite difference over 1ms
+    pub fn velocity(&self, now: u64) -> f64 {
+        (self.value(now + 1_000_000) - self.value(now)) * 1000.0
+    }
+}
+
+// -- oklab color lerp --
+
+fn srgb_to_lin(c: f64) -> f64 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn lin_to_srgb(c: f64) -> f64 {
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn to_oklab(rgb: [f32; 4]) -> [f64; 3] {
+    let (r, g, b) = (
+        srgb_to_lin(rgb[0] as f64),
+        srgb_to_lin(rgb[1] as f64),
+        srgb_to_lin(rgb[2] as f64),
+    );
+    let l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
+    let m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b).cbrt();
+    let s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).cbrt();
+    [
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    ]
+}
+
+fn from_oklab(lab: [f64; 3], alpha: f32) -> [f32; 4] {
+    let l = (lab[0] + 0.3963377774 * lab[1] + 0.2158037573 * lab[2]).powi(3);
+    let m = (lab[0] - 0.1055613458 * lab[1] - 0.0638541728 * lab[2]).powi(3);
+    let s = (lab[0] - 0.0894841775 * lab[1] - 1.2914855480 * lab[2]).powi(3);
+    let r = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+    let g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+    let b = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+    [
+        lin_to_srgb(r.max(0.0)).clamp(0.0, 1.0) as f32,
+        lin_to_srgb(g.max(0.0)).clamp(0.0, 1.0) as f32,
+        lin_to_srgb(b.max(0.0)).clamp(0.0, 1.0) as f32,
+        alpha,
+    ]
+}
+
+pub fn lerp_oklab(a: [f32; 4], b: [f32; 4], t: f64) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    if t == 0.0 {
+        return a;
+    }
+    let (la, lb) = (to_oklab(a), to_oklab(b));
+    let lab = [
+        la[0] + (lb[0] - la[0]) * t,
+        la[1] + (lb[1] - la[1]) * t,
+        la[2] + (lb[2] - la[2]) * t,
+    ];
+    let alpha = (a[3] as f64 + (b[3] as f64 - a[3] as f64) * t) as f32;
+    from_oklab(lab, alpha)
 }
 
 #[cfg(test)]
@@ -225,6 +422,80 @@ mod tests {
         // underdamped touches target well before it rests
         let u = SpringK::new(0.5, 800.0, 0.0001);
         assert!(spring_clamped(&u, 1.0, 0.0) < spring_duration(&u, 1.0, 0.0));
+    }
+
+    #[test]
+    fn anim_ease_lifecycle() {
+        let clock = AnimClock::new();
+        clock.freeze(1_000_000_000);
+        let a = Anim::ease(&clock, 10.0, 20.0, 100, Curve::Linear);
+        assert_eq!(a.value(1_000_000_000), 10.0);
+        assert!((a.value(1_050_000_000) - 15.0).abs() < 1e-9);
+        assert_eq!(a.value(1_100_000_000), 20.0);
+        assert!(!a.is_done(1_099_000_000));
+        assert!(a.is_done(1_100_000_000));
+        // before start clamps to from
+        assert_eq!(a.value(900_000_000), 10.0);
+    }
+
+    #[test]
+    fn anim_off_completes_instantly() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        clock.set_global(true, 1.0);
+        let a = Anim::ease(&clock, 0.0, 5.0, 1000, Curve::Linear);
+        assert!(a.is_done(0));
+        assert_eq!(a.value(0), 5.0);
+    }
+
+    #[test]
+    fn anim_slowdown_scales_time() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        clock.set_global(false, 2.0);
+        let a = Anim::ease(&clock, 0.0, 1.0, 100, Curve::Linear);
+        // halfway at 100ms of a 2x-slowed 100ms animation
+        assert!((a.value(100_000_000) - 0.5).abs() < 1e-9);
+        assert!(a.is_done(200_000_000));
+    }
+
+    #[test]
+    fn anim_spring_clamped_value_never_overshoots() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        let a = Anim::spring(&clock, 0.0, 1.0, 0.0, SpringK::new(0.5, 800.0, 0.0001));
+        let mut over = false;
+        for i in 0..500u64 {
+            let now = i * 2_000_000; // 2ms steps
+            if a.value(now) > 1.0 {
+                over = true;
+            }
+            assert!(a.clamped_value(now) <= 1.0 + 1e-9);
+        }
+        assert!(over, "raw value overshoots for an underdamped spring");
+    }
+
+    #[test]
+    fn anim_offset_retargets_in_place() {
+        let clock = AnimClock::new();
+        clock.freeze(0);
+        let mut a = Anim::ease(&clock, 0.0, 10.0, 100, Curve::Linear);
+        a.offset(5.0);
+        assert_eq!(a.value(0), 5.0);
+        assert_eq!(a.value(100_000_000), 15.0);
+    }
+
+    #[test]
+    fn oklab_endpoints_and_alpha() {
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let blue = [0.0, 0.0, 1.0, 0.5];
+        assert_eq!(lerp_oklab(red, blue, 0.0), red);
+        let end = lerp_oklab(red, blue, 1.0);
+        for i in 0..4 {
+            assert!((end[i] - blue[i]).abs() < 1e-4, "channel {i}");
+        }
+        let mid = lerp_oklab(red, blue, 0.5);
+        assert!((mid[3] - 0.75).abs() < 1e-6, "alpha lerps linearly");
     }
 
     #[test]
