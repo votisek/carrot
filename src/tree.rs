@@ -385,8 +385,12 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
     let ws = active(state);
     if let Some(d) = state.display.borrow().as_ref() {
         if let Some(out) = d.outputs.borrow().get(ws.output.get()) {
+            let prev_shown = out.ws.get();
             out.ws.set(idx);
             state.focused_output.set(ws.output.get());
+            if prev_shown != idx {
+                crate::output::start_ws_switch(state, out, prev_shown, idx);
+            }
         }
     }
     relayout(state, &ws);
@@ -412,6 +416,13 @@ pub fn switch_workspace(state: &Rc<State>, idx: usize) {
     focus_window(state, target.as_ref());
     crate::ipc::emit(state, &serde_json::json!({ "workspace": idx + 1 }));
     state.damage.trigger();
+}
+
+/// scrolling workspaces own the horizontal axis; any of them forces the
+/// workspace stack vertical. an all-dwindle session slides horizontally
+pub fn ws_axis_vertical(_state: &Rc<State>) -> bool {
+    // no scrolling layout mode exists yet
+    false
 }
 
 pub(crate) fn cursor_pos(state: &Rc<State>) -> (i32, i32) {

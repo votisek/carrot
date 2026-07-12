@@ -349,6 +349,21 @@ pub struct Output {
     /// a live animation was sampled during this output's compose; the
     /// present loop stays dirty until one compose sees none
     pub anim_pending: Cell<bool>,
+    /// an in-flight workspace switch; compose draws both scenes offset
+    pub ws_switch: RefCell<Option<WsSwitch>>,
+}
+
+#[derive(Clone)]
+pub struct WsSwitch {
+    pub from_ws: usize,
+    /// 0 -> 1, arrival of the target workspace
+    pub anim: crate::anim::Anim,
+    pub vert: bool,
+    /// slide distance as a fraction of the span; 0 = pure crossfade
+    pub dist: f64,
+    pub fade: bool,
+    /// +1 when the target has the higher index
+    pub sign: f64,
 }
 
 impl Output {
@@ -1469,7 +1484,47 @@ fn init_output(
         cursor_tex: RefCell::new(None),
         cursor_gen: Cell::new(0),
         anim_pending: Cell::new(false),
+        ws_switch: RefCell::new(None),
     })
+}
+
+/// both scenes travel one step apart; out exits opposite the in's entry
+fn switch_offsets(p: f64, step: f64, sign: f64) -> (f64, f64) {
+    (-p * step * sign, (1.0 - p) * step * sign)
+}
+
+pub fn start_ws_switch(state: &Rc<State>, out: &Rc<Output>, from: usize, to: usize) {
+    use crate::config::Style;
+    let cfg = state.config.borrow().clone();
+    let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WorkspaceSwitch) else {
+        *out.ws_switch.borrow_mut() = None;
+        return;
+    };
+    let style = cfg.animations.workspace_switch.style.clone();
+    let vert = matches!(style, Style::SlideVert | Style::SlideFadeVert { .. })
+        || crate::tree::ws_axis_vertical(state);
+    let (dist, fade) = match &style {
+        Style::Fade => (0.0, true),
+        Style::SlideFade { perc } | Style::SlideFadeVert { perc } => (*perc, true),
+        _ => (1.0, false),
+    };
+    let sign = if to > from { 1.0 } else { -1.0 };
+    state.anim_clock.touch();
+    let now = state.anim_clock.now();
+    let mut sw = out.ws_switch.borrow_mut();
+    let anim = match &*sw {
+        // a switch mid-slide restarts from the current progress
+        Some(cur) if !cur.anim.is_done(now) => crate::config::build_anim(
+            &state.anim_clock,
+            motion,
+            &cfg.animations,
+            1.0 - cur.anim.clamped_value(now),
+            1.0,
+            cur.anim.velocity(now),
+        ),
+        _ => crate::config::build_anim(&state.anim_clock, motion, &cfg.animations, 0.0, 1.0, 0.0),
+    };
+    *sw = Some(WsSwitch { from_ws: from, anim, vert, dist, fade, sign });
 }
 
 async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
@@ -1863,70 +1918,40 @@ fn compose_ops(
     let screen = out.rect();
     let cfg = state.config.borrow().clone();
 
-    let draw = |win: &Rc<crate::tree::Window>, ops: &mut Vec<RenderOp>, live: &mut Vec<(ClientId, u64)>| {
-        let surface = win.surface();
-        if !surface.mapped.get() {
-            return;
-        }
-        let mark = ops.len();
-        let lmark = live.len();
-        let rect = win.visual_rect(state);
-        if win.anims_live(state.anim_clock.now()) {
-            out.anim_pending.set(true);
-        }
-        if !win.fullscreen.get() {
-            let color = match &focused {
-                Some(f) => {
-                    if Rc::ptr_eq(f, &surface) {
-                        cfg.layout.border.active
-                    } else {
-                        cfg.layout.border.inactive
-                    }
-                }
-                None => cfg.layout.border.inactive,
-            };
-            push_borders(out, rect, cfg.layout.border.width, color, ops);
-        }
-        let geo = win.geometry();
-        let alpha = win.rule_opacity.get().unwrap_or(1.0);
-        draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, ops, live);
-        if let Some(tl) = win.xdg_opt() {
-            draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
-        }
-        let open = win.anims.borrow().open.clone();
-        if let Some((a, style)) = open {
-            if !win.fullscreen.get() {
-                use crate::config::Style;
-                let p = a.clamped_value(state.anim_clock.now());
-                let (scale, alpha, d) = match &style {
-                    Style::Popin { perc } => {
-                        ((perc + (1.0 - perc) * p) as f32, p as f32, [0.0, 0.0])
-                    }
-                    Style::Fade => (1.0, p as f32, [0.0, 0.0]),
-                    Style::Slide { dir } => (1.0, 1.0, slide_delta(out, rect, *dir, 1.0 - p)),
-                    _ => (1.0, 1.0, [0.0, 0.0]),
-                };
-                apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d);
-            }
-        }
-        *win.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
-    };
-
     // paint order: background, bottom, tiled, fullscreen, floats, top,
     // overlay, layer popups; fullscreen hides everything below itself
     // except overlay
     if fs.is_none() {
         draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live);
         draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live);
-        ws.tiling.for_each(|win| draw(win, &mut ops, &mut live));
-        draw_closings(state, out, &ws, &mut ops);
     }
-    if let Some(fs) = &fs {
-        draw(fs, &mut ops, &mut live);
-    }
-    if fs.is_none() || cfg.layout.float_above_fullscreen {
-        for win in ws.floats.borrow().iter() {
-            draw(win, &mut ops, &mut live);
+    let sw = out.ws_switch.borrow().clone();
+    let now = state.anim_clock.now();
+    match &sw {
+        Some(s) if !s.anim.is_done(now) => {
+            let p = s.anim.clamped_value(now);
+            // full ndc span plus a tenth of it as the gap between scenes
+            let step = 2.2 * s.dist;
+            let (off_out, off_in) = switch_offsets(p, step, s.sign);
+            let (a_out, a_in) = if s.fade { ((1.0 - p) as f32, p as f32) } else { (1.0, 1.0) };
+            let from = state.workspaces.borrow().get(s.from_ws).cloned();
+            if let Some(from) = from {
+                let mark = ops.len();
+                ws_scene(state, out, &from, &focused, &cfg, screen, &mut ops, &mut live);
+                let d = if s.vert { [0.0, off_out as f32] } else { [off_out as f32, 0.0] };
+                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_out, d);
+            }
+            let mark = ops.len();
+            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live);
+            let d = if s.vert { [0.0, off_in as f32] } else { [off_in as f32, 0.0] };
+            apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_in, d);
+            out.anim_pending.set(true);
+        }
+        _ => {
+            if sw.is_some() {
+                *out.ws_switch.borrow_mut() = None;
+            }
+            ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live);
         }
     }
     if fs.is_none() {
@@ -2262,6 +2287,89 @@ fn draw_buffer(
     });
 }
 
+/// one workspace's content: tiled, closings, fullscreen, floats
+fn ws_scene(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    ws: &Rc<crate::tree::workspace::Workspace>,
+    focused: &Option<Rc<WlSurface>>,
+    cfg: &crate::config::Config,
+    screen: Rect,
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<(ClientId, u64)>,
+) {
+    let fs = ws.fullscreen.borrow().clone();
+    if fs.is_none() {
+        ws.tiling
+            .for_each(|win| draw_window(state, out, focused, cfg, screen, win, ops, live));
+        draw_closings(state, out, ws, ops);
+    }
+    if let Some(f) = &fs {
+        draw_window(state, out, focused, cfg, screen, f, ops, live);
+    }
+    if fs.is_none() || cfg.layout.float_above_fullscreen {
+        for win in ws.floats.borrow().iter() {
+            draw_window(state, out, focused, cfg, screen, win, ops, live);
+        }
+    }
+}
+
+fn draw_window(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    focused: &Option<Rc<WlSurface>>,
+    cfg: &crate::config::Config,
+    screen: Rect,
+    win: &Rc<crate::tree::Window>,
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<(ClientId, u64)>,
+) {
+    let surface = win.surface();
+    if !surface.mapped.get() {
+        return;
+    }
+    let mark = ops.len();
+    let lmark = live.len();
+    let rect = win.visual_rect(state);
+    if win.anims_live(state.anim_clock.now()) {
+        out.anim_pending.set(true);
+    }
+    if !win.fullscreen.get() {
+        let color = match focused {
+            Some(f) => {
+                if Rc::ptr_eq(f, &surface) {
+                    cfg.layout.border.active
+                } else {
+                    cfg.layout.border.inactive
+                }
+            }
+            None => cfg.layout.border.inactive,
+        };
+        push_borders(out, rect, cfg.layout.border.width, color, ops);
+    }
+    let geo = win.geometry();
+    let alpha = win.rule_opacity.get().unwrap_or(1.0);
+    draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, ops, live);
+    if let Some(tl) = win.xdg_opt() {
+        draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
+    }
+    let open = win.anims.borrow().open.clone();
+    if let Some((a, style)) = open {
+        if !win.fullscreen.get() {
+            use crate::config::Style;
+            let p = a.clamped_value(state.anim_clock.now());
+            let (scale, alpha, d) = match &style {
+                Style::Popin { perc } => ((perc + (1.0 - perc) * p) as f32, p as f32, [0.0, 0.0]),
+                Style::Fade => (1.0, p as f32, [0.0, 0.0]),
+                Style::Slide { dir } => (1.0, 1.0, slide_delta(out, rect, *dir, 1.0 - p)),
+                _ => (1.0, 1.0, [0.0, 0.0]),
+            };
+            apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d);
+        }
+    }
+    *win.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
+}
+
 // -- closing windows: the final batch outlives the surface --
 
 pub struct ClosingWindow {
@@ -2434,6 +2542,19 @@ fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switch_offsets_travel_together() {
+        // start: incoming parked a full step away, outgoing in place
+        let (o, i) = switch_offsets(0.0, 2.2, 1.0);
+        assert_eq!((o, i), (0.0, 2.2));
+        // end: outgoing fully out the opposite side, incoming settled
+        let (o, i) = switch_offsets(1.0, 2.2, 1.0);
+        assert_eq!((o, i), (-2.2, 0.0));
+        // the gap between them stays one step the whole way
+        let (o, i) = switch_offsets(0.37, 2.2, -1.0);
+        assert!(((i - o) - -2.2).abs() < 1e-6);
+    }
 
     #[test]
     fn closing_cap_evicts_oldest() {
