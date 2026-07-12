@@ -4,6 +4,7 @@
 
 use super::*;
 
+mod anims;
 mod binds;
 mod input;
 mod layout;
@@ -70,6 +71,7 @@ fn parse_into(cfg: &mut Config, src: &str, reset_lists: bool) -> Result<Config, 
         let singleton = matches!(
             name,
             "input" | "layout" | "cursor" | "screencast" | "binds" | "environment" | "debug"
+                | "animations"
         );
         if singleton {
             if seen.contains(&name) {
@@ -79,6 +81,7 @@ fn parse_into(cfg: &mut Config, src: &str, reset_lists: bool) -> Result<Config, 
             seen.push(name);
         }
         match name {
+            "animations" => anims::parse(node, cfg, &mut cx),
             "input" => input::parse(node, cfg, &mut cx),
             "output" => output::parse(node, cfg, &mut cx),
             "layout" => layout::parse(node, cfg, &mut cx),
@@ -91,7 +94,7 @@ fn parse_into(cfg: &mut Config, src: &str, reset_lists: bool) -> Result<Config, 
                 misc::parse(node, cfg, &mut cx)
             }
             // reserved: the feature behind the name does not exist yet
-            "workspace" | "animations" | "switch-events" => {
+            "workspace" | "switch-events" => {
                 cx.at(node, &format!("{name}: not implemented yet"));
             }
             other => cx.at(node, &format!("unknown key \"{other}\"")),

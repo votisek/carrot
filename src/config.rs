@@ -235,6 +235,180 @@ pub struct LayerRule {
     pub matches: Vec<String>,
 }
 
+// -- animations: per-kind spring/ease motion plus visual styles --
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Motion {
+    Spring { damping: f64, stiffness: f64, epsilon: f64 },
+    Ease { ms: u32, curve: CurveRef },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CurveRef {
+    Linear,
+    Quad,
+    Cubic,
+    Expo,
+    Named(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Style {
+    /// kind-appropriate builtin (popin for windows, slide for the rest)
+    Default,
+    /// scale from `perc` of full size about the center, fading in
+    Popin { perc: f64 },
+    Fade,
+    /// None picks the nearest edge (windows/layers) or the axis rule (workspaces)
+    Slide { dir: Option<Dir> },
+    SlideVert,
+    SlideFade { perc: f64 },
+    SlideFadeVert { perc: f64 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KindCfg {
+    pub off: bool,
+    /// None inherits the section's default motion
+    pub motion: Option<Motion>,
+    pub style: Style,
+}
+
+impl Default for KindCfg {
+    fn default() -> KindCfg {
+        KindCfg { off: false, motion: None, style: Style::Default }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum AnimKind {
+    WindowOpen,
+    WindowClose,
+    WindowMove,
+    WindowResize,
+    WorkspaceSwitch,
+    ViewMovement,
+    LayerOpen,
+    LayerClose,
+    BorderColor,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnimsCfg {
+    pub off: bool,
+    pub slowdown: f64,
+    pub curves: Vec<(String, crate::anim::CubicBezier)>,
+    pub default_motion: Motion,
+    pub window_open: KindCfg,
+    pub window_close: KindCfg,
+    pub window_move: KindCfg,
+    pub window_resize: KindCfg,
+    pub workspace_switch: KindCfg,
+    pub view_movement: KindCfg,
+    pub layer_open: KindCfg,
+    pub layer_close: KindCfg,
+    pub border_color: KindCfg,
+}
+
+impl Default for AnimsCfg {
+    fn default() -> AnimsCfg {
+        AnimsCfg {
+            off: false,
+            slowdown: 1.0,
+            curves: Vec::new(),
+            default_motion: Motion::Spring { damping: 1.0, stiffness: 800.0, epsilon: 0.0001 },
+            window_open: KindCfg {
+                off: false,
+                motion: Some(Motion::Ease { ms: 150, curve: CurveRef::Expo }),
+                style: Style::Popin { perc: 0.8 },
+            },
+            window_close: KindCfg {
+                off: false,
+                motion: Some(Motion::Ease { ms: 150, curve: CurveRef::Quad }),
+                style: Style::Popin { perc: 0.8 },
+            },
+            window_move: KindCfg::default(),
+            window_resize: KindCfg::default(),
+            workspace_switch: KindCfg {
+                off: false,
+                motion: Some(Motion::Spring { damping: 1.0, stiffness: 1000.0, epsilon: 0.0001 }),
+                style: Style::Slide { dir: None },
+            },
+            view_movement: KindCfg::default(),
+            layer_open: KindCfg { off: false, motion: None, style: Style::Slide { dir: None } },
+            layer_close: KindCfg { off: false, motion: None, style: Style::Slide { dir: None } },
+            border_color: KindCfg {
+                off: false,
+                motion: Some(Motion::Ease { ms: 200, curve: CurveRef::Quad }),
+                style: Style::Default,
+            },
+        }
+    }
+}
+
+impl AnimsCfg {
+    pub fn kind(&self, k: AnimKind) -> &KindCfg {
+        match k {
+            AnimKind::WindowOpen => &self.window_open,
+            AnimKind::WindowClose => &self.window_close,
+            AnimKind::WindowMove => &self.window_move,
+            AnimKind::WindowResize => &self.window_resize,
+            AnimKind::WorkspaceSwitch => &self.workspace_switch,
+            AnimKind::ViewMovement => &self.view_movement,
+            AnimKind::LayerOpen => &self.layer_open,
+            AnimKind::LayerClose => &self.layer_close,
+            AnimKind::BorderColor => &self.border_color,
+        }
+    }
+
+    /// None = this kind is disabled; global off still resolves (the clock
+    /// makes those animations complete instantly)
+    pub fn motion(&self, k: AnimKind) -> Option<&Motion> {
+        let kc = self.kind(k);
+        if kc.off {
+            return None;
+        }
+        Some(kc.motion.as_ref().unwrap_or(&self.default_motion))
+    }
+
+    pub fn curve(&self, r: &CurveRef) -> crate::anim::Curve {
+        match r {
+            CurveRef::Linear => crate::anim::Curve::Linear,
+            CurveRef::Quad => crate::anim::Curve::EaseOutQuad,
+            CurveRef::Cubic => crate::anim::Curve::EaseOutCubic,
+            CurveRef::Expo => crate::anim::Curve::EaseOutExpo,
+            // unknown names were rejected at parse; fall back sanely anyway
+            CurveRef::Named(n) => self
+                .curves
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, b)| crate::anim::Curve::Bezier(*b))
+                .unwrap_or(crate::anim::Curve::Linear),
+        }
+    }
+}
+
+/// motion + clock -> a running Anim
+pub fn build_anim(
+    clock: &crate::anim::AnimClock,
+    motion: &Motion,
+    anims: &AnimsCfg,
+    from: f64,
+    to: f64,
+    v0: f64,
+) -> crate::anim::Anim {
+    match motion {
+        Motion::Ease { ms, curve } => crate::anim::Anim::ease(clock, from, to, *ms, anims.curve(curve)),
+        Motion::Spring { damping, stiffness, epsilon } => crate::anim::Anim::spring(
+            clock,
+            from,
+            to,
+            v0,
+            crate::anim::SpringK::new(*damping, *stiffness, *epsilon),
+        ),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub input: InputCfg,
@@ -251,6 +425,7 @@ pub struct Config {
     pub layer_rules: Vec<LayerRule>,
     pub remaps: Vec<RemapProfile>,
     pub debug: DebugCfg,
+    pub animations: AnimsCfg,
 }
 
 impl Default for Config {
@@ -276,6 +451,7 @@ pub(crate) fn empty() -> Config {
         layer_rules: Vec::new(),
         remaps: Vec::new(),
         debug: DebugCfg::default(),
+        animations: AnimsCfg::default(),
     }
 }
 
