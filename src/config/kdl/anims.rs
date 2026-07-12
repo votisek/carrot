@@ -69,12 +69,12 @@ pub(super) fn parse(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
     }
 }
 
-fn prop_f64(node: &KdlNode, name: &str) -> Option<f64> {
+pub(super) fn prop_f64(node: &KdlNode, name: &str) -> Option<f64> {
     node.get(name)
         .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
 }
 
-fn prop_str<'a>(node: &'a KdlNode, name: &str) -> Option<&'a str> {
+pub(super) fn prop_str<'a>(node: &'a KdlNode, name: &str) -> Option<&'a str> {
     node.get(name).and_then(|v| v.as_string())
 }
 
@@ -245,6 +245,22 @@ mod tests {
         assert!(c.animations.window_move.motion.is_none());
         assert!(c.animations.motion(AnimKind::WindowMove).is_none());
         assert!(c.animations.motion(AnimKind::ViewMovement).is_some());
+    }
+
+    #[test]
+    fn window_rule_animation_overrides() {
+        let c = parse_ok(
+            "window-rule {\n match app-id=\"foo\"\n no-anim\n animation \"fade\"\n }",
+        );
+        assert!(c.rules[0].no_anim);
+        assert_eq!(c.rules[0].animation, Some(Style::Fade));
+        let fx = rule_effects(&c, "foo", "", false, false);
+        assert!(fx.no_anim);
+        assert_eq!(fx.animation, Some(Style::Fade));
+        // workspace styles never fit a window rule
+        let errs =
+            parse_errs("window-rule {\n match app-id=\"x\"\n animation \"slidefadevert\"\n }");
+        assert!(errs.iter().any(|e| e.contains("style")), "{errs:?}");
     }
 
     #[test]

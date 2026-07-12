@@ -686,6 +686,19 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     if win.wants_fullscreen() && fx.floating != Some(true) {
         set_fullscreen(state, win, true);
     }
+    if fx.no_anim {
+        win.anims_snap();
+    } else if let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowOpen) {
+        let style = match fx.animation.clone().unwrap_or_else(|| cfg.animations.window_open.style.clone()) {
+            crate::config::Style::Default => crate::config::Style::Popin { perc: 0.8 },
+            s => s,
+        };
+        state.anim_clock.touch();
+        win.anims.borrow_mut().open = Some((
+            crate::config::build_anim(&state.anim_clock, motion, &cfg.animations, 0.0, 1.0, 0.0),
+            style,
+        ));
+    }
     // a rule-targeted background workspace never steals focus
     if visible {
         focus_window(state, Some(win));

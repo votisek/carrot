@@ -100,6 +100,24 @@ pub(super) fn window_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     rule.allow_tearing = b;
                 }
             }
+            "no-anim" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.no_anim = b;
+                }
+            }
+            "animation" => {
+                if let Some(s) = cx.str_(c) {
+                    match style_from(
+                        StyleFamily::Win,
+                        &s,
+                        super::anims::prop_f64(c, "perc"),
+                        super::anims::prop_str(c, "dir"),
+                    ) {
+                        Ok(st) => rule.animation = Some(st),
+                        Err(e) => cx.leaf(c, e),
+                    }
+                }
+            }
             other => cx.at(c, &format!("unknown window-rule key \"{other}\"")),
         }
     }

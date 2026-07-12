@@ -512,26 +512,31 @@ fn anim_kind(
                 if family == super::StyleFamily::MotionOnly {
                     return Err(format!("{what} takes no style"));
                 }
-                let t = table(&v, "style")?;
-                let name = t
-                    .iter()
-                    .find_map(|(k, v)| if vint(&k) == Some(1) { vstr(&v) } else { None })
-                    .ok_or("style wants { \"name\", ... }")?;
-                let mut perc = None;
-                let mut dir = None;
-                for (k, v) in t.iter() {
-                    match vstr(&k).as_deref() {
-                        Some("perc") => perc = Some(need_num(&v, "perc")?),
-                        Some("dir") => dir = Some(need_str(&v, "dir")?),
-                        _ => {}
-                    }
-                }
-                out.style = super::style_from(family, &name, perc, dir.as_deref())?;
+                out.style = lua_style(&v, family)?;
             }
             other => return Err(format!("unknown animation key `{other}`")),
         }
     }
     Ok(())
+}
+
+/// { "name", perc = n, dir = ".." } through the shared style validator
+fn lua_style(v: &Value, family: super::StyleFamily) -> Result<super::Style, String> {
+    let t = table(v, "style")?;
+    let name = t
+        .iter()
+        .find_map(|(k, v)| if vint(&k) == Some(1) { vstr(&v) } else { None })
+        .ok_or("style wants { \"name\", ... }")?;
+    let mut perc = None;
+    let mut dir = None;
+    for (k, v) in t.iter() {
+        match vstr(&k).as_deref() {
+            Some("perc") => perc = Some(need_num(&v, "perc")?),
+            Some("dir") => dir = Some(need_str(&v, "dir")?),
+            _ => {}
+        }
+    }
+    super::style_from(family, &name, perc, dir.as_deref())
 }
 
 fn cursor(v: &Value, cfg: &mut Config) -> Result<(), String> {
@@ -803,6 +808,11 @@ fn window_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                 }
                 "allow_tearing" => {
                     rule.allow_tearing = need_bool(&v, &key).map_err(whine)?;
+                }
+                "no_anim" => rule.no_anim = need_bool(&v, &key).map_err(whine)?,
+                "animation" => {
+                    rule.animation =
+                        Some(lua_style(&v, super::StyleFamily::Win).map_err(whine)?);
                 }
                 other => return Err(whine(format!("unknown rule key `{other}`"))),
             }

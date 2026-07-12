@@ -1868,6 +1868,7 @@ fn compose_ops(
         if !surface.mapped.get() {
             return;
         }
+        let mark = ops.len();
         let rect = win.visual_rect(state);
         if win.anims_live(state.anim_clock.now()) {
             out.anim_pending.set(true);
@@ -1890,6 +1891,22 @@ fn compose_ops(
         draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, ops, live);
         if let Some(tl) = win.xdg_opt() {
             draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
+        }
+        let open = win.anims.borrow().open.clone();
+        if let Some((a, style)) = open {
+            if !win.fullscreen.get() {
+                use crate::config::Style;
+                let p = a.clamped_value(state.anim_clock.now());
+                let (scale, alpha, d) = match &style {
+                    Style::Popin { perc } => {
+                        ((perc + (1.0 - perc) * p) as f32, p as f32, [0.0, 0.0])
+                    }
+                    Style::Fade => (1.0, p as f32, [0.0, 0.0]),
+                    Style::Slide { dir } => (1.0, 1.0, slide_delta(out, rect, *dir, 1.0 - p)),
+                    _ => (1.0, 1.0, [0.0, 0.0]),
+                };
+                apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d);
+            }
         }
     };
 
@@ -2243,6 +2260,69 @@ fn draw_buffer(
 }
 
 /// four fills just outside the window box
+// -- op-batch transforms: open/close styles, workspace slides --
+
+/// scale about an ndc center, multiply alpha, then translate; the whole
+/// window (borders, subsurfaces, popups) moves as one
+fn apply_batch(ops: &mut [RenderOp], center: [f32; 2], scale: f32, alpha: f32, d: [f32; 2]) {
+    for op in ops {
+        match op {
+            RenderOp::Fill { pos, size, color } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                }
+                color[3] *= alpha;
+            }
+            RenderOp::Tex { pos, size, mul, opaque, .. } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                }
+                *mul *= alpha;
+                if alpha < 1.0 {
+                    *opaque = false;
+                }
+            }
+        }
+    }
+}
+
+fn center_ndc(out: &Output, r: Rect) -> [f32; 2] {
+    let (gx, gy) = out.pos.get();
+    [
+        ((r.x1 + r.x2) as f32 / 2.0 - gx as f32) / out.width as f32 * 2.0 - 1.0,
+        ((r.y1 + r.y2) as f32 / 2.0 - gy as f32) / out.height as f32 * 2.0 - 1.0,
+    ]
+}
+
+/// the ndc offset that parks the window past a screen edge at remaining=1
+/// and decays to zero; no dir picks the nearest edge
+fn slide_delta(out: &Output, r: Rect, dir: Option<crate::config::Dir>, remaining: f64) -> [f32; 2] {
+    use crate::config::Dir;
+    let (gx, gy) = out.pos.get();
+    let (w, h) = (out.width as i32, out.height as i32);
+    let dir = dir.unwrap_or_else(|| {
+        let gaps = [
+            (r.y1 - gy, Dir::Up),
+            (gy + h - r.y2, Dir::Down),
+            (r.x1 - gx, Dir::Left),
+            (gx + w - r.x2, Dir::Right),
+        ];
+        gaps.iter().min_by_key(|(g, _)| *g).map(|(_, d)| *d).unwrap_or(Dir::Up)
+    });
+    let (px, py) = match dir {
+        Dir::Up => (0, -(r.y2 - gy)),
+        Dir::Down => (0, gy + h - r.y1),
+        Dir::Left => (-(r.x2 - gx), 0),
+        Dir::Right => (gx + w - r.x1, 0),
+    };
+    [
+        (px as f64 * remaining / out.width as f64 * 2.0) as f32,
+        (py as f64 * remaining / out.height as f64 * 2.0) as f32,
+    ]
+}
+
 fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Vec<RenderOp>) {
     let sides = [
         Rect { x1: r.x1 - b, y1: r.y1 - b, x2: r.x2 + b, y2: r.y1 },
@@ -2262,5 +2342,27 @@ fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Ve
             ],
             color,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_batch_scales_about_center_and_fades() {
+        let mut ops = vec![RenderOp::Fill {
+            pos: [-0.5, -0.5],
+            size: [1.0, 1.0],
+            color: [1.0; 4],
+        }];
+        apply_batch(&mut ops, [0.0, 0.0], 0.5, 0.5, [0.25, 0.0]);
+        let RenderOp::Fill { pos, size, color } = &ops[0] else {
+            panic!("op kind changed");
+        };
+        // -0.5 scaled about 0 is -0.25; x then translates by +0.25
+        assert_eq!(*pos, [0.0, -0.25]);
+        assert_eq!(*size, [0.5, 0.5]);
+        assert_eq!(color[3], 0.5);
     }
 }

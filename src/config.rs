@@ -228,6 +228,9 @@ pub struct WindowRule {
     // dynamic effects
     pub opacity: Option<f64>,
     pub allow_tearing: bool,
+    pub no_anim: bool,
+    /// open/close style override, window-style grammar
+    pub animation: Option<Style>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -805,6 +808,8 @@ pub struct RuleFx {
     pub opacity: Option<f64>,
     pub size: Option<(i32, i32)>,
     pub center: bool,
+    pub no_anim: bool,
+    pub animation: Option<Style>,
 }
 
 fn matcher_hits(
@@ -863,6 +868,10 @@ pub fn rule_effects(
             fx.size = Some(sz);
         }
         fx.center |= r.open_centered;
+        fx.no_anim |= r.no_anim;
+        if let Some(a) = &r.animation {
+            fx.animation = Some(a.clone());
+        }
     }
     fx
 }
