@@ -168,7 +168,9 @@ pub fn surface_committed(state: &Rc<State>, surface: &Rc<crate::surface::WlSurfa
         return;
     }
     let root = surface.get_root();
-    let win = crate::tree::window_for_surface(state, &root);
+    // any workspace, not just the active one: a hidden cast's source is
+    // off-glass by definition, so the active-only lookup never finds it
+    let win = crate::tree::window_for_surface_any(state, &root);
     let mut kick = false;
     for c in state.casts.borrow().iter() {
         if c.dead.get() || c.dirty.get() {

@@ -533,6 +533,24 @@ pub fn window_for_surface(state: &Rc<State>, s: &Rc<WlSurface>) -> Option<Rc<Win
     found
 }
 
+/// like window_for_surface but searches every workspace, not just the
+/// active one. a hidden-workspace cast routes its source's commits by
+/// surface, and those windows are by definition off the active workspace
+pub fn window_for_surface_any(state: &Rc<State>, s: &Rc<WlSurface>) -> Option<Rc<Window>> {
+    let mut found = None;
+    for ws in state.workspaces.borrow().iter() {
+        ws.for_each(|w| {
+            if found.is_none() && Rc::ptr_eq(&w.surface(), s) {
+                found = Some(w.clone());
+            }
+        });
+        if found.is_some() {
+            break;
+        }
+    }
+    found
+}
+
 // -- map / unmap --
 
 pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {

@@ -1682,6 +1682,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hidden_workspace_window_is_still_found_by_surface() {
+        // the freeze bug: a cast routes a hidden source's commits by
+        // surface, but window_for_surface only searched the active
+        // workspace, so the lookup lost the window the instant you swapped
+        // off it and the stream stopped updating.
+        let (state, client, s, xdg, tl) = setup();
+        map(&state, &client, &s, &xdg, 20);
+        let win = tl.window.borrow().clone().unwrap();
+        assert!(crate::tree::window_for_surface(&state, &s).is_some());
+        assert!(crate::tree::window_for_surface_any(&state, &s).is_some());
+        // push a second workspace and make it active: the window is hidden
+        state
+            .workspaces
+            .borrow_mut()
+            .push(std::rc::Rc::new(crate::tree::workspace::Workspace::default()));
+        state.active_ws.set(1);
+        // active-only lookup loses it - this is what starved the cast
+        assert!(
+            crate::tree::window_for_surface(&state, &s).is_none(),
+            "active-only lookup should not see the hidden window"
+        );
+        // the all-workspace lookup keeps finding it - the fix
+        let found = crate::tree::window_for_surface_any(&state, &s);
+        assert!(found.is_some(), "hidden-workspace window must still resolve");
+        assert!(Rc::ptr_eq(&found.unwrap(), &win));
+    }
+
+    #[test]
     fn second_window_splits_the_first() {
         let (state, client, s1, x1, t1) = setup();
         map(&state, &client, &s1, &x1, 20);
