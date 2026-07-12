@@ -59,3 +59,4 @@
 - Screenshare Restore Tokens
 - Shell Agnostic Share Picker
 - Presentation Time (wp_presentation)
+- Config Overhaul (New Schema, Embedded Default, Multi Error Reporting)

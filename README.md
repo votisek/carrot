@@ -12,6 +12,7 @@ A pure Rust tiling Wayland compositor with zero linked C, all the way down to th
 
 ### Tiling
 - **Dwindle layout** with directional focus, window swapping, and split ratio control
+- **Scrolling layout** - an endless horizontal strip of columns per workspace, scrolled by focus
 - **Window groups** (tabbed) with a styled groupbar
 - **Floating layer** with mouse drag move/resize, centering, and PiP mode
 - Fullscreen (real, bordered, and borderless), pin (visible on all workspaces)
@@ -73,43 +74,43 @@ Carrot uses [KDL](https://kdl.dev) for configuration, with full NixOS and Home M
 
 Lua configuration is also officially supported as an opt-in alternative - KDL stays the default. It's a runtime switch (no rebuild needed), and on NixOS / Home Manager you declare it through the module.
 
+On first run carrot writes a fully commented default config to
+`~/.config/carrot/carrot.kdl` - that file doubles as the option reference,
+with `CONFIG.md` as the compact index. A broken config never strands the
+session: carrot starts on the built-in default and reports every parse
+error (all of them, with line:col) on stderr and over IPC.
+
 ```kdl
-general {
-    layout "dwindle"
-    allow-tearing true
-    border-size 3
+input {
+    keyboard { repeat-delay 250; repeat-rate 35 }
+    mouse { accel-profile "flat" }
 }
 
-decoration {
-    rounding 10
-    blur {
-        enabled true
-        size 8
-        passes 2
-    }
-    shadow {
-        enabled true
-        range 20
-    }
+layout {
+    mode "dwindle"
+    gaps-in 5
+    gaps-out 10
+    border { width 2; active-color "#89b4fa" }
 }
 
-animations {
-    bezier "standard" 0.2 0.0 0.0 1.0
-
-    animation "windowsIn" {
-        enabled true
-        speed 5
-        curve "standard"
-    }
+output "DP-3" {
+    mode "2560x1440@480"
+    variable-refresh-rate
+    allow-tearing
 }
 
 window-rule {
-    match class="steam_app_.*"
-    immediate true
-    idle-inhibit "always"
+    match app-id=#"^steam_app_"#
+    open-floating #true
+    allow-tearing #true
 }
 
-bind "Super" "Return" "exec" "foot"
+binds {
+    Mod+Return { spawn "foot"; }
+    Mod+F { toggle-fullscreen; }
+    Mod+1 { focus-workspace 1; }
+    XF86AudioMute allow-when-locked=#true { spawn "wpctl" "set-mute" "@DEFAULT_AUDIO_SINK@" "toggle"; }
+}
 ```
 
 <details>
@@ -127,13 +128,13 @@ wayland.windowManager.carrot = {
   enable = true;
   configFormat = "lua"; # optional, defaults to "kdl"
   settings = {
-    general = {
-      layout = "dwindle";
-      allow_tearing = true;
+    layout = {
+      mode = "dwindle";
+      gaps_in = 5;
+      border = { width = 2; active_color = "#89b4fa"; };
     };
-    decoration = {
-      rounding = 10;
-      blur = { enabled = true; size = 8; passes = 2; };
+    input = {
+      keyboard = { repeat_rate = 35; };
     };
   };
 };
@@ -152,6 +153,9 @@ one consent step:
 - with no picker configured, the next **left click** picks the window (or
   output) under the cursor - Escape or any other button cancels, and the
   click never reaches the app.
+
+Casts follow their source off the visible workspace: a hidden window or
+workspace keeps streaming, driven by its own commits.
 
 The picker is any program: it receives one JSON candidate per line on stdin
 and answers with the chosen `id` on stdout (empty output or exit without an
@@ -190,7 +194,7 @@ never grabs the seat, so shell-drawn menus receive their clicks normally.
 ### With Nix
 
 ```sh
-nix build github:flammablebunny/carrot
+nix build github:carrot-wm/carrot
 ```
 
 ### With Cargo
