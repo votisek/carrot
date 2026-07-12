@@ -105,6 +105,24 @@ pub(super) fn window_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     rule.no_anim = b;
                 }
             }
+            "rounding" => {
+                if let Some(v) = cx.int(c) {
+                    match int_in(v, "rounding", 0, 200) {
+                        Ok(v) => rule.rounding = Some(v as i32),
+                        Err(e) => cx.leaf(c, e),
+                    }
+                }
+            }
+            "shadow" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.shadow = Some(b);
+                }
+            }
+            "dim" => {
+                if let Some(b) = cx.flag(c) {
+                    rule.dim = Some(b);
+                }
+            }
             "animation" => {
                 if let Some(s) = cx.str_(c) {
                     match style_from(

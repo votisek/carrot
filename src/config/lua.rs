@@ -16,7 +16,7 @@
 use super::{
     Action, Bind, CenterFocus, ColWidthCfg, Config, CurveRef, DeviceRule, Dir, KindCfg, LayerRule,
     LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch,
-    SetLayoutArg, SpawnCfg, Vrr, WindowRule,
+    SetLayoutArg, ShadowCfg, SpawnCfg, Vrr, WindowRule,
 };
 use piccolo::{Closure, Executor, Lua, Table, Value};
 
@@ -158,6 +158,7 @@ fn build(root: Table) -> Result<Config, Vec<String>> {
         };
         let r = match key.as_str() {
             "animations" => animations(&v, &mut cfg),
+            "decoration" => decoration(&v, &mut cfg),
             "input" => input(&v, &mut cfg),
             "outputs" => outputs(&v, &mut cfg),
             "layout" => layout(&v, &mut cfg),
@@ -502,6 +503,58 @@ fn animations(v: &Value, cfg: &mut Config) -> Result<(), String> {
             if !known.contains(&n) {
                 return Err(format!("unknown curve `{n}`"));
             }
+        }
+    }
+    Ok(())
+}
+
+fn decoration(v: &Value, cfg: &mut Config) -> Result<(), String> {
+    let d = &mut cfg.decoration;
+    for (k, v) in table(v, "decoration")?.iter() {
+        let key = vstr(&k).ok_or("decoration keys must be strings")?;
+        match key.as_str() {
+            "rounding" => {
+                d.rounding =
+                    super::int_in(need_int(&v, &key)?, "rounding", 0, 200)? as i32;
+            }
+            "rounding_power" => {
+                d.rounding_power =
+                    super::f64_in(need_num(&v, &key)?, "rounding_power", 1.0, 8.0)?;
+            }
+            "dim_inactive" => {
+                d.dim_inactive =
+                    super::f64_in(need_num(&v, &key)?, "dim_inactive", 0.0, 1.0)?;
+            }
+            "shadow" => {
+                let mut s = ShadowCfg::default();
+                for (k, v) in table(&v, "shadow")?.iter() {
+                    let key = vstr(&k).ok_or("shadow keys must be strings")?;
+                    match key.as_str() {
+                        "size" => {
+                            s.size = super::int_in(need_int(&v, &key)?, "size", 1, 200)? as i32;
+                        }
+                        "color" => s.color = super::color(&need_str(&v, &key)?)?,
+                        "offset" => {
+                            let xy: Vec<i64> =
+                                indexed_entries(&v, &key)?.iter().filter_map(vint).collect();
+                            let [x, y] = xy.as_slice() else {
+                                return Err("offset is { x, y }".to_string());
+                            };
+                            if x.abs() > 500 || y.abs() > 500 {
+                                return Err("offset is within -500..500".to_string());
+                            }
+                            s.offset = (*x as i32, *y as i32);
+                        }
+                        "power" => {
+                            s.power = super::f64_in(need_num(&v, &key)?, "power", 0.5, 8.0)?;
+                        }
+                        other => return Err(format!("unknown shadow key `{other}`")),
+                    }
+                }
+                d.shadow = Some(s);
+            }
+            "blur" => return Err("blur: not implemented yet".to_string()),
+            other => return Err(format!("unknown decoration key `{other}`")),
         }
     }
     Ok(())
@@ -878,6 +931,14 @@ fn window_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                     rule.allow_tearing = need_bool(&v, &key).map_err(whine)?;
                 }
                 "no_anim" => rule.no_anim = need_bool(&v, &key).map_err(whine)?,
+                "rounding" => {
+                    rule.rounding = Some(
+                        super::int_in(need_int(&v, &key).map_err(whine)?, "rounding", 0, 200)
+                            .map_err(whine)? as i32,
+                    );
+                }
+                "shadow" => rule.shadow = Some(need_bool(&v, &key).map_err(whine)?),
+                "dim" => rule.dim = Some(need_bool(&v, &key).map_err(whine)?),
                 "animation" => {
                     rule.animation =
                         Some(lua_style(&v, super::StyleFamily::Win).map_err(whine)?);

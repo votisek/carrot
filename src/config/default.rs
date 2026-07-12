@@ -69,6 +69,12 @@ cursor {
     // software
 }
 
+// decoration {
+//     rounding 10
+//     dim-inactive 0.1
+//     shadow { size 20; color "#00000099"; offset 0 4 }
+// }
+
 // per-kind motion is a spring or an ease; unset kinds inherit the
 // section's default spring. styles: windows/layers take popin, fade,
 // slide; workspace-switch takes slide, slidevert, fade, slidefade,

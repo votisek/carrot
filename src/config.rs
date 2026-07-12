@@ -185,6 +185,38 @@ pub struct LayoutCfg {
     pub scrolling: ScrollCfg,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShadowCfg {
+    pub size: i32,
+    pub color: [f32; 4],
+    pub offset: (i32, i32),
+    /// falloff exponent; higher hugs the window tighter
+    pub power: f64,
+}
+
+impl Default for ShadowCfg {
+    fn default() -> ShadowCfg {
+        ShadowCfg { size: 20, color: [0.0, 0.0, 0.0, 0.6], offset: (0, 4), power: 2.0 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecoCfg {
+    /// corner radius px; 0 = square
+    pub rounding: i32,
+    /// parsed and stored; the shader family is circular until a
+    /// superellipse need shows up
+    pub rounding_power: f64,
+    pub dim_inactive: f64,
+    pub shadow: Option<ShadowCfg>,
+}
+
+impl Default for DecoCfg {
+    fn default() -> DecoCfg {
+        DecoCfg { rounding: 0, rounding_power: 2.0, dim_inactive: 0.0, shadow: None }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct CursorCfg {
     pub xcursor_theme: Option<String>,
@@ -286,6 +318,9 @@ pub struct WindowRule {
     pub no_anim: bool,
     /// open/close style override, window-style grammar
     pub animation: Option<Style>,
+    pub rounding: Option<i32>,
+    pub shadow: Option<bool>,
+    pub dim: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -542,6 +577,7 @@ pub struct Config {
     pub remaps: Vec<RemapProfile>,
     pub debug: DebugCfg,
     pub animations: AnimsCfg,
+    pub decoration: DecoCfg,
 }
 
 impl Default for Config {
@@ -568,6 +604,7 @@ pub(crate) fn empty() -> Config {
         remaps: Vec::new(),
         debug: DebugCfg::default(),
         animations: AnimsCfg::default(),
+        decoration: DecoCfg::default(),
     }
 }
 
@@ -895,6 +932,9 @@ pub struct RuleFx {
     pub center: bool,
     pub no_anim: bool,
     pub animation: Option<Style>,
+    pub rounding: Option<i32>,
+    pub shadow: Option<bool>,
+    pub dim: Option<bool>,
 }
 
 fn matcher_hits(
@@ -956,6 +996,15 @@ pub fn rule_effects(
         fx.no_anim |= r.no_anim;
         if let Some(a) = &r.animation {
             fx.animation = Some(a.clone());
+        }
+        if let Some(v) = r.rounding {
+            fx.rounding = Some(v);
+        }
+        if let Some(v) = r.shadow {
+            fx.shadow = Some(v);
+        }
+        if let Some(v) = r.dim {
+            fx.dim = Some(v);
         }
     }
     fx

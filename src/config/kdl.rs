@@ -6,6 +6,7 @@ use super::*;
 
 mod anims;
 mod binds;
+mod deco;
 mod input;
 mod layout;
 mod misc;
@@ -71,7 +72,7 @@ fn parse_into(cfg: &mut Config, src: &str, reset_lists: bool) -> Result<Config, 
         let singleton = matches!(
             name,
             "input" | "layout" | "cursor" | "screencast" | "binds" | "environment" | "debug"
-                | "animations"
+                | "animations" | "decoration"
         );
         if singleton {
             if seen.contains(&name) {
@@ -82,6 +83,7 @@ fn parse_into(cfg: &mut Config, src: &str, reset_lists: bool) -> Result<Config, 
         }
         match name {
             "animations" => anims::parse(node, cfg, &mut cx),
+            "decoration" => deco::parse(node, cfg, &mut cx),
             "input" => input::parse(node, cfg, &mut cx),
             "output" => output::parse(node, cfg, &mut cx),
             "layout" => layout::parse(node, cfg, &mut cx),
