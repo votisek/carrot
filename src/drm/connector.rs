@@ -38,6 +38,10 @@ pub struct Connector {
     /// fires on every flip completion; the present loop hangs off this
     pub vblank: AsyncEvent,
     pub sequence: Cell<u32>,
+    /// last flip's kernel timestamp, (tv_sec, tv_usec)
+    pub flip_time: Cell<(u32, u32)>,
+    /// flip sequence widened across u32 wraps
+    pub seq64: Cell<u64>,
     out_fence: Cell<Option<OwnedFd>>,
     /// tearing is invisible in logs otherwise; announce the first async flip
     async_announced: Cell<bool>,
@@ -97,6 +101,8 @@ impl Connector {
             async_announced: Cell::new(false),
             vblank: AsyncEvent::default(),
             sequence: Cell::new(0),
+            flip_time: Cell::new((0, 0)),
+            seq64: Cell::new(0),
             out_fence: Cell::new(None),
             change: RefCell::new(Change::default()),
         }))
@@ -488,6 +494,10 @@ impl Connector {
     pub fn flip_done(&self, ev: &FlipComplete) {
         self.flip_pending.set(false);
         self.sequence.set(ev.sequence);
+        self.flip_time.set((ev.tv_sec, ev.tv_usec));
+        let prev = self.seq64.get();
+        let hi = if ev.sequence < prev as u32 { (prev >> 32) + 1 } else { prev >> 32 };
+        self.seq64.set(hi << 32 | ev.sequence as u64);
         self.vblank.trigger();
     }
 

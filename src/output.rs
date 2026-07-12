@@ -335,6 +335,12 @@ pub struct Output {
     /// implicit-sync fences of the dmabufs drawn this frame; the render
     /// submit waits them so client work lands before we sample
     frame_fences: RefCell<Vec<std::os::fd::OwnedFd>>,
+    /// latched feedbacks drained here while composing for the display
+    present_fbs: RefCell<Vec<crate::protocol::presentation::Feedback>>,
+    collect_fbs: Cell<bool>,
+    /// feedbacks riding the queued flip; fired on its completion event
+    inflight_fbs: RefCell<Vec<crate::protocol::presentation::Feedback>>,
+    inflight_vsync: Cell<bool>,
     /// a vrr config on an incapable panel complains once, not per frame
     vrr_warned: Cell<bool>,
     /// software-cursor texture; rebuilt when the image generation moves
@@ -1452,6 +1458,10 @@ fn init_output(
         theme_cursor: RefCell::new(None),
         rearm: RefCell::new(None),
         frame_fences: RefCell::new(Vec::new()),
+        present_fbs: RefCell::new(Vec::new()),
+        collect_fbs: Cell::new(false),
+        inflight_fbs: RefCell::new(Vec::new()),
+        inflight_vsync: Cell::new(true),
         vrr_warned: Cell::new(false),
         cursor_tex: RefCell::new(None),
         cursor_gen: Cell::new(0),
@@ -1463,6 +1473,34 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
     loop {
         EitherEvent(&out.damage, &out.conn.vblank).await;
         let _ = out.conn.vblank.take();
+        // the completed flip carries the kernel timestamp its feedbacks
+        // have been waiting for
+        if !out.conn.flip_pending.get() && !out.inflight_fbs.borrow().is_empty() {
+            let (sec, usec) = out.conn.flip_time.get();
+            let refresh = if out.conn.vrr_want.get() {
+                // no fixed period exists under variable refresh
+                0
+            } else {
+                out.conn
+                    .pipe
+                    .borrow()
+                    .as_ref()
+                    .map(|p| {
+                        let m = &p.mode;
+                        (m.htotal as u64 * m.vtotal as u64 * 1_000_000 / m.clock.max(1) as u64)
+                            as u32
+                    })
+                    .unwrap_or(0)
+            };
+            let mut flags = crate::protocol::presentation::FLAG_HW_CLOCK
+                | crate::protocol::presentation::FLAG_HW_COMPLETION;
+            if out.inflight_vsync.get() {
+                flags |= crate::protocol::presentation::FLAG_VSYNC;
+            }
+            for fb in out.inflight_fbs.borrow_mut().drain(..) {
+                fb.presented(&out.conn.name, sec, usec * 1000, refresh, out.conn.seq64.get(), flags);
+            }
+        }
         dirty |= out.damage.take();
         // render only when dirty AND the pipe is free
         if !dirty || out.conn.flip_pending.get() || out.paused.get() {
@@ -1514,6 +1552,7 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         // render fence into the commit
         let sync = frame.export_sync_file(&out.renderer).ok().map(Rc::new);
         out.conn.vrr_want.set(vrr_wanted(state, out));
+        out.inflight_vsync.set(true);
         let res = if tearing_wanted(state, out) && !out.conn.vrr_dirty() {
             // async commits are FB-only - no fence rides along, so the render
             // has to be finished before the kernel sees the buffer
@@ -1526,7 +1565,10 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
                 Err(_) => out
                     .conn
                     .flip(&out.dev, buf.fb, sync.as_ref().map(|fd| fd.as_raw_fd())),
-                res => res,
+                res => {
+                    out.inflight_vsync.set(false);
+                    res
+                }
             }
         } else {
             out.conn
@@ -1535,6 +1577,9 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         match res {
             Ok(FlipResult::Queued) => {
                 out.front.set(back);
+                out.inflight_fbs
+                    .borrow_mut()
+                    .append(&mut out.present_fbs.borrow_mut());
             }
             Ok(FlipResult::NotPresented) => {
                 // retry next wakeup with a fresh frame
@@ -1542,7 +1587,13 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
             }
             Err(crate::drm::device::DrmError::LostMaster) => {
                 // vt left between the pause signal and our commit; resume
-                // re-modesets and re-damages
+                // re-modesets and re-damages. abandoned frames never present
+                for fb in out.present_fbs.borrow_mut().drain(..) {
+                    fb.discarded();
+                }
+                for fb in out.inflight_fbs.borrow_mut().drain(..) {
+                    fb.discarded();
+                }
                 out.paused.set(true);
                 dirty = true;
             }
@@ -1723,7 +1774,12 @@ enum CapCursor {
 }
 
 fn compose(state: &Rc<State>, out: &Rc<Output>) -> Vec<RenderOp> {
-    compose_ops(state, out, CapCursor::Present, None)
+    // presentation feedbacks are claimed only by display composes, never
+    // by captures
+    out.collect_fbs.set(true);
+    let ops = compose_ops(state, out, CapCursor::Present, None);
+    out.collect_fbs.set(false);
+    ops
 }
 
 fn compose_ops(
@@ -1872,6 +1928,12 @@ fn draw_surface_tree(
 ) {
     if !surface.mapped.get() {
         return;
+    }
+    if out.collect_fbs.get() {
+        let mut latched = surface.latched_feedbacks.borrow_mut();
+        if !latched.is_empty() {
+            out.present_fbs.borrow_mut().append(&mut latched);
+        }
     }
     let children = surface.children.borrow();
     if let Some(ch) = &*children {
