@@ -25,7 +25,7 @@ const SOURCE_MONITOR: u32 = 1;
 const SOURCE_WINDOW: u32 = 2;
 const CURSOR_HIDDEN: u32 = 1;
 const CURSOR_EMBEDDED: u32 = 2;
-// version 4: restore_token/persist_mode understood
+// version 4: restore_data/persist_mode understood
 const VERSION: u32 = 4;
 // portal response codes
 const R_CANCELLED: u32 = 1;
@@ -36,7 +36,7 @@ struct Session {
     types: Cell<u32>,
     /// requested persistence; we grant at most 1 (compositor lifetime)
     persist: Cell<u32>,
-    /// what a presented restore_token resolved to
+    /// what presented restore_data decoded to
     restore: RefCell<Option<cast::RestoreData>>,
     /// the in-flight Start; dropping it cancels the cast setup
     starting: Cell<Option<SpawnedFuture<()>>>,
@@ -56,68 +56,6 @@ impl Default for Session {
 }
 
 type Sessions = Rc<RefCell<HashMap<String, Session>>>;
-
-struct Token {
-    data: cast::RestoreData,
-    /// survives restarts (persist mode 2); mirrored to the state file
-    disk: bool,
-}
-
-type Tokens = Rc<RefCell<HashMap<String, Token>>>;
-
-fn token_path() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
-        })?;
-    Some(base.join("carrot").join("screencast-tokens.json"))
-}
-
-fn load_tokens() -> HashMap<String, Token> {
-    let Some(path) = token_path() else {
-        return HashMap::new();
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    match serde_json::from_str::<HashMap<String, cast::RestoreData>>(&text) {
-        Ok(m) => m
-            .into_iter()
-            .map(|(k, data)| (k, Token { data, disk: true }))
-            .collect(),
-        Err(e) => {
-            eprintln!("carrot: portal: {}: {e}", path.display());
-            HashMap::new()
-        }
-    }
-}
-
-fn save_tokens(tokens: &HashMap<String, Token>) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let Some(path) = token_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let disk: HashMap<&String, &cast::RestoreData> = tokens
-        .iter()
-        .filter(|(_, t)| t.disk)
-        .map(|(k, t)| (k, &t.data))
-        .collect();
-    let Ok(text) = serde_json::to_string(&disk) else { return };
-    // tokens are standing consent: owner-only
-    let res = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .and_then(|mut f| f.write_all(text.as_bytes()));
-    if let Err(e) = res {
-        eprintln!("carrot: portal: {}: {e}", path.display());
-    }
-}
 
 /// a click-to-select in flight; the seat answers it from the next click
 pub struct PendingPick {
@@ -282,7 +220,7 @@ fn put_streams_entry(b: &mut MsgBuilder, cast: &cast::Cast) {
     });
 }
 
-fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, state: Rc<State>) {
+fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, state: Rc<State>) {
     use crate::dbus::wire::SvVal;
     let me = conn.clone();
     conn.serve(IF_SCREENCAST, Box::new(move |c, call| {
@@ -323,9 +261,10 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                         ("cursor_mode", SvVal::U(m)) => s.cursor_mode.set(*m),
                         ("types", SvVal::U(t)) => s.types.set(*t),
                         ("persist_mode", SvVal::U(p)) => s.persist.set(*p),
-                        ("restore_token", SvVal::S(t)) => {
-                            *s.restore.borrow_mut() =
-                                tokens.borrow().get(t).map(|tok| tok.data.clone());
+                        // the frontend owns tokens; what we get back is our
+                        // own restore_data payload out of its permission store
+                        ("restore_data", SvVal::Suv(vendor, _, data)) if vendor == "carrot" => {
+                            *s.restore.borrow_mut() = serde_json::from_str(data).ok();
                         }
                         _ => {}
                     }
@@ -360,7 +299,6 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                 let (serial, dest) = (call.serial, call.sender.clone());
                 let me = me.clone();
                 let st = state.clone();
-                let toks = tokens.clone();
                 let sess = session.clone();
                 let task = state.eng.spawn("cast start", async move {
                     let pick = if let Some(r) = restore {
@@ -392,30 +330,24 @@ fn serve_screencast(conn: &Rc<DbusConn>, sessions: Sessions, tokens: Tokens, sta
                     };
                     match cast::start(&st, sess, cursor, pick).await {
                         Ok(cast) => {
-                            let token = (persist > 0).then(|| {
-                                let t = format!(
-                                    "carrot:{:x}:{:x}",
-                                    st.next_uid(),
-                                    crate::util::Time::now().nsec()
-                                );
-                                let disk = persist >= 2;
-                                toks.borrow_mut().insert(
-                                    t.clone(),
-                                    Token { data: cast.restore_data(), disk },
-                                );
-                                if disk {
-                                    save_tokens(&toks.borrow());
-                                }
-                                t
-                            });
+                            // restore_data rides the frontend's permission
+                            // store; it mints the app-facing token itself
+                            let restore = (persist > 0)
+                                .then(|| serde_json::to_string(&cast.restore_data()).ok())
+                                .flatten();
                             me.reply_to(serial, &dest, "ua{sv}", |b| {
                                 b.put_u32(0);
                                 b.put_array(8, |b| {
                                     put_streams_entry(b, &cast);
-                                    if let Some(t) = &token {
+                                    if let Some(d) = &restore {
                                         b.align(8);
-                                        b.put_str("restore_token");
-                                        b.put_variant("s", |b| b.put_str(t));
+                                        b.put_str("restore_data");
+                                        b.put_variant("(suv)", |b| {
+                                            b.align(8);
+                                            b.put_str("carrot");
+                                            b.put_u32(1);
+                                            b.put_variant("s", |b| b.put_str(d));
+                                        });
                                         b.align(8);
                                         b.put_str("persist_mode");
                                         b.put_variant("u", |b| b.put_u32(persist.min(2)));
@@ -456,9 +388,8 @@ async fn run_inner(
 ) -> Result<(), DbusError> {
     let conn = DbusConn::connect_session(eng, ring).await?;
     let sessions: Sessions = Rc::new(RefCell::new(HashMap::new()));
-    let tokens: Tokens = Rc::new(RefCell::new(load_tokens()));
     serve_properties(&conn);
-    serve_screencast(&conn, sessions.clone(), tokens, state.clone());
+    serve_screencast(&conn, sessions.clone(), state.clone());
     conn.serve(IF_SESSION, Box::new({
         let sessions = sessions.clone();
         let state = state.clone();

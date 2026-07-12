@@ -293,6 +293,9 @@ pub fn parse(msg: &[u8]) -> Result<Header, DbusError> {
 pub enum SvVal {
     U(u32),
     S(String),
+    /// a (suv) struct: vendor, version, string payload (the portal's
+    /// restore_data shape; other payload types are dropped)
+    Suv(String, u32, String),
 }
 
 pub struct Rd<'a> {
@@ -381,6 +384,17 @@ impl<'a> Rd<'a> {
             match sig.as_str() {
                 "u" => out.push((key, SvVal::U(self.u32()?))),
                 "s" => out.push((key, SvVal::S(self.str()?))),
+                "(suv)" => {
+                    self.align(8)?;
+                    let vendor = self.str()?;
+                    let version = self.u32()?;
+                    let inner = self.sig()?;
+                    if inner == "s" {
+                        out.push((key, SvVal::Suv(vendor, version, self.str()?)));
+                    } else {
+                        self.skip_value(&inner)?;
+                    }
+                }
                 _ => self.skip_value(&sig)?,
             }
         }
