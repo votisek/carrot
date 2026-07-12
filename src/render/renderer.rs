@@ -29,6 +29,20 @@ struct TexPush {
     mul: f32,
 }
 
+#[repr(C)]
+struct TexRPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    uv_pos: [f32; 2],
+    uv_size: [f32; 2],
+    mul: f32,
+    _pad: f32, // spir-v vec2 members sit on 8-byte offsets
+    geo_pos: [f32; 2],
+    geo_size: [f32; 2],
+    radius: f32,
+    aa: f32,
+}
+
 fn push_bytes<T>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((v as *const T).cast(), size_of::<T>()) }
 }
@@ -52,6 +66,17 @@ pub enum RenderOp {
         mul: f32,
         opaque: bool,
     },
+    /// tex clipped to a rounded rect; geo/radius in output-local pixels
+    TexR {
+        view: vk::ImageView,
+        pos: [f32; 2],
+        size: [f32; 2],
+        uv_pos: [f32; 2],
+        uv_size: [f32; 2],
+        mul: f32,
+        geo_px: [f32; 4],
+        radius: f32,
+    },
 }
 
 impl RenderOp {
@@ -59,6 +84,7 @@ impl RenderOp {
         match self {
             RenderOp::Fill { color, .. } => color[3] < 1.0,
             RenderOp::Tex { opaque, mul, .. } => !opaque || *mul < 1.0,
+            RenderOp::TexR { .. } => true,
         }
     }
 }
@@ -107,6 +133,7 @@ struct Pipelines {
     fill_blend: vk::Pipeline,
     tex_opaque: vk::Pipeline,
     tex_blend: vk::Pipeline,
+    texr_blend: vk::Pipeline,
 }
 
 pub struct Renderer {
@@ -115,6 +142,7 @@ pub struct Renderer {
     sampler: vk::Sampler,
     tex_set_layout: vk::DescriptorSetLayout,
     tex_layout: vk::PipelineLayout,
+    texr_layout: vk::PipelineLayout,
     fill_layout: vk::PipelineLayout,
     pipes: Pipelines,
     pool: vk::CommandPool,
@@ -164,17 +192,28 @@ impl Renderer {
             .push_constant_ranges(&tex_range);
         let tex_layout = unsafe { dev.create_pipeline_layout(&tex_layout_info, None) }?;
 
+        let texr_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<TexRPush>() as u32)];
+        let texr_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&texr_range);
+        let texr_layout = unsafe { dev.create_pipeline_layout(&texr_layout_info, None) }?;
+
         let fill_module = create_module(dev, shaders::FILL)?;
         let tex_module = create_module(dev, shaders::TEX)?;
+        let texr_module = create_module(dev, shaders::TEXR)?;
         let pipes = Pipelines {
             fill_opaque: create_pipeline(dev, format, fill_module, fill_layout, false)?,
             fill_blend: create_pipeline(dev, format, fill_module, fill_layout, true)?,
             tex_opaque: create_pipeline(dev, format, tex_module, tex_layout, false)?,
             tex_blend: create_pipeline(dev, format, tex_module, tex_layout, true)?,
+            texr_blend: create_pipeline(dev, format, texr_module, texr_layout, true)?,
         };
         unsafe {
             dev.destroy_shader_module(fill_module, None);
             dev.destroy_shader_module(tex_module, None);
+            dev.destroy_shader_module(texr_module, None);
         }
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -191,6 +230,7 @@ impl Renderer {
             sampler,
             tex_set_layout,
             tex_layout,
+            texr_layout,
             fill_layout,
             pipes,
             pool,
@@ -296,6 +336,7 @@ impl Renderer {
                 (RenderOp::Fill { .. }, true) => (self.pipes.fill_blend, self.fill_layout),
                 (RenderOp::Tex { .. }, false) => (self.pipes.tex_opaque, self.tex_layout),
                 (RenderOp::Tex { .. }, true) => (self.pipes.tex_blend, self.tex_layout),
+                (RenderOp::TexR { .. }, _) => (self.pipes.texr_blend, self.texr_layout),
             };
             unsafe {
                 if pipe != bound {
@@ -348,6 +389,52 @@ impl Renderer {
                             uv_pos: *uv_pos,
                             uv_size: *uv_size,
                             mul: *mul,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::TexR {
+                        view,
+                        pos,
+                        size,
+                        uv_pos,
+                        uv_size,
+                        mul,
+                        geo_px,
+                        radius,
+                    } => {
+                        let image_info = vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+                        let infos = [image_info];
+                        let write = vk::WriteDescriptorSet::default()
+                            .dst_binding(0)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(&infos);
+                        self.core.ext_push_desc.cmd_push_descriptor_set(
+                            cb,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            layout,
+                            0,
+                            &[write],
+                        );
+                        let pc = TexRPush {
+                            pos: *pos,
+                            size: *size,
+                            uv_pos: *uv_pos,
+                            uv_size: *uv_size,
+                            mul: *mul,
+                            _pad: 0.0,
+                            geo_pos: [geo_px[0], geo_px[1]],
+                            geo_size: [geo_px[2], geo_px[3]],
+                            radius: radius.max(1.0),
+                            aa: 0.7,
                         };
                         dev.cmd_push_constants(
                             cb,

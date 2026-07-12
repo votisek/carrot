@@ -750,7 +750,7 @@ pub fn window_capture(state: &Rc<State>, win: &Rc<crate::tree::Window>) -> Optio
     let geo = win.geometry();
     let mut ops = Vec::new();
     let mut live = Vec::new();
-    draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, &mut ops, &mut live);
+    draw_surface_tree(&out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, 1.0, 0.0, &mut ops, &mut live);
     let mut waits = Vec::new();
     for fence in out.frame_fences.borrow_mut().drain(..) {
         if let Ok(sem) = out.renderer.import_wait(fence) {
@@ -1885,7 +1885,7 @@ fn compose_ops(
     if crate::protocol::session_lock::locked(state) {
         let screen = out.rect();
         if let Some(s) = crate::protocol::session_lock::compose_locked(state, &out.conn.name) {
-            draw_surface_tree(out, &s, screen.x1, screen.y1, screen, 1.0, &mut ops, &mut live);
+            draw_surface_tree(out, &s, screen.x1, screen.y1, screen, 1.0, 0.0, &mut ops, &mut live);
         }
         if cursor != CapCursor::Never {
             draw_sw_cursor(state, out, &mut ops, cursor == CapCursor::Always);
@@ -1942,12 +1942,12 @@ fn compose_ops(
                 let mark = ops.len();
                 ws_scene(state, out, &from, &focused, &cfg, screen, &mut ops, &mut live);
                 let d = if s.vert { [0.0, off_out as f32] } else { [off_out as f32, 0.0] };
-                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_out, d);
+                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_out, d, out_dims(out));
             }
             let mark = ops.len();
             ws_scene(state, out, &ws, &focused, &cfg, screen, &mut ops, &mut live);
             let d = if s.vert { [0.0, off_in as f32] } else { [off_in as f32, 0.0] };
-            apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_in, d);
+            apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, a_in, d, out_dims(out));
             out.anim_pending.set(true);
         }
         _ => {
@@ -1970,7 +1970,7 @@ fn compose_ops(
                 if let Some(icon) = drag.icon.borrow().clone() {
                     let (dx, dy) = drag.icon_off.get();
                     let (px, py) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
-                    draw_surface_tree(out, &icon, px + dx, py + dy, screen, 1.0, &mut ops, &mut live);
+                    draw_surface_tree(out, &icon, px + dx, py + dy, screen, 1.0, 0.0, &mut ops, &mut live);
                 }
             }
         }
@@ -2007,6 +2007,7 @@ fn draw_surface_tree(
     y: i32,
     clip: Rect,
     alpha: f32,
+    round: f32,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, u64)>,
 ) {
@@ -2032,16 +2033,16 @@ fn draw_surface_tree(
         drop(children);
         for sub in &stack[..below] {
             let (px, py) = sub.position.get();
-            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, ops, live);
+            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, round, ops, live);
         }
-        draw_buffer(out, surface, x, y, clip, alpha, ops, live);
+        draw_buffer(out, surface, x, y, clip, alpha, round, ops, live);
         for sub in &stack[below..] {
             let (px, py) = sub.position.get();
-            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, ops, live);
+            draw_surface_tree(out, &sub.surface, x + px, y + py, clip, alpha, round, ops, live);
         }
     } else {
         drop(children);
-        draw_buffer(out, surface, x, y, clip, alpha, ops, live);
+        draw_buffer(out, surface, x, y, clip, alpha, round, ops, live);
     }
 }
 
@@ -2061,7 +2062,7 @@ fn draw_popup(
     let (rx, ry) = p.rel.get();
     let (px, py) = (ox + rx, oy + ry);
     let geo = p.xdg.geometry();
-    draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, 1.0, ops, live);
+    draw_surface_tree(out, &p.xdg.surface, px - geo.x1, py - geo.y1, screen, 1.0, 0.0, ops, live);
     draw_popups(state, out, &p.xdg, px, py, screen, ops, live);
 }
 
@@ -2098,7 +2099,7 @@ fn draw_layer(
         let r = ls.rect.get();
         let mark = ops.len();
         let lmark = live.len();
-        draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, ops, live);
+        draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, 0.0, ops, live);
         let anim = ls.anim.borrow().clone();
         if let Some((a, style)) = anim {
             use crate::config::Style;
@@ -2118,7 +2119,7 @@ fn draw_layer(
                     }
                     _ => (1.0, 1.0, [0.0, 0.0]),
                 };
-                apply_batch(&mut ops[mark..], center_ndc(out, r), scale, alpha, d);
+                apply_batch(&mut ops[mark..], center_ndc(out, r), scale, alpha, d, out_dims(out));
                 out.anim_pending.set(true);
             }
         }
@@ -2158,6 +2159,7 @@ fn draw_buffer(
     y: i32,
     clip: Rect,
     alpha: f32,
+    round: f32,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, u64)>,
 ) {
@@ -2297,24 +2299,47 @@ fn draw_buffer(
     let (gx, gy) = out.pos.get();
     let fx = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
     let fy = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
-    ops.push(RenderOp::Tex {
-        view: tex.view,
-        pos: [fx(vis.x1), fy(vis.y1)],
-        size: [
-            (vis.width()) as f32 / out.width as f32 * 2.0,
-            (vis.height()) as f32 / out.height as f32 * 2.0,
-        ],
-        uv_pos: [
-            (vis.x1 - dst.x1) as f32 / sw as f32,
-            (vis.y1 - dst.y1) as f32 / sh as f32,
-        ],
-        uv_size: [
-            vis.width() as f32 / sw as f32,
-            vis.height() as f32 / sh as f32,
-        ],
-        mul: alpha,
-        opaque: opaque && alpha >= 1.0,
-    });
+    let pos = [fx(vis.x1), fy(vis.y1)];
+    let size = [
+        (vis.width()) as f32 / out.width as f32 * 2.0,
+        (vis.height()) as f32 / out.height as f32 * 2.0,
+    ];
+    let uv_pos = [
+        (vis.x1 - dst.x1) as f32 / sw as f32,
+        (vis.y1 - dst.y1) as f32 / sh as f32,
+    ];
+    let uv_size = [
+        vis.width() as f32 / sw as f32,
+        vis.height() as f32 / sh as f32,
+    ];
+    if round >= 0.5 {
+        // clip corners against the window geometry, not this quad
+        ops.push(RenderOp::TexR {
+            view: tex.view,
+            pos,
+            size,
+            uv_pos,
+            uv_size,
+            mul: alpha,
+            geo_px: [
+                (clip.x1 - gx) as f32,
+                (clip.y1 - gy) as f32,
+                clip.width() as f32,
+                clip.height() as f32,
+            ],
+            radius: round,
+        });
+    } else {
+        ops.push(RenderOp::Tex {
+            view: tex.view,
+            pos,
+            size,
+            uv_pos,
+            uv_size,
+            mul: alpha,
+            opaque: opaque && alpha >= 1.0,
+        });
+    }
 }
 
 /// one workspace's content: tiled, closings, fullscreen, floats
@@ -2339,7 +2364,7 @@ fn ws_scene(
             let dx = ws.tiling.strip.draw_offset_px(now);
             if dx.abs() >= 0.5 {
                 let d = [(dx / out.width as f64 * 2.0) as f32, 0.0];
-                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, 1.0, d);
+                apply_batch(&mut ops[mark..], [0.0, 0.0], 1.0, 1.0, d, out_dims(out));
                 out.anim_pending.set(true);
             } else {
                 *ws.tiling.strip.view_anim.borrow_mut() = None;
@@ -2392,7 +2417,15 @@ fn draw_window(
     }
     let geo = win.geometry();
     let alpha = win.rule_opacity.get().unwrap_or(1.0);
-    draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, ops, live);
+    let round = if win.fullscreen.get() {
+        0.0
+    } else {
+        win.rule_rounding
+            .get()
+            .unwrap_or(cfg.decoration.rounding)
+            .max(0) as f32
+    };
+    draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, round, ops, live);
     if let Some(tl) = win.xdg_opt() {
         draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
     }
@@ -2407,7 +2440,7 @@ fn draw_window(
                 Style::Slide { dir } => (1.0, 1.0, slide_delta(out, rect, *dir, 1.0 - p)),
                 _ => (1.0, 1.0, [0.0, 0.0]),
             };
-            apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d);
+            apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d, out_dims(out));
         }
     }
     *win.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
@@ -2520,7 +2553,7 @@ fn draw_closing_list(
             // popin and everything else: shrink toward 80% while fading
             _ => ((0.8 + 0.2 * p) as f32, p as f32, [0.0, 0.0]),
         };
-        apply_batch(&mut ops[mark..], center_ndc(out, c.rect), scale, alpha, d);
+        apply_batch(&mut ops[mark..], center_ndc(out, c.rect), scale, alpha, d, out_dims(out));
         out.anim_pending.set(true);
     }
 }
@@ -2529,7 +2562,20 @@ fn draw_closing_list(
 
 /// scale about an ndc center, multiply alpha, then translate; the whole
 /// window (borders, subsurfaces, popups) moves as one
-fn apply_batch(ops: &mut [RenderOp], center: [f32; 2], scale: f32, alpha: f32, d: [f32; 2]) {
+fn apply_batch(
+    ops: &mut [RenderOp],
+    center: [f32; 2],
+    scale: f32,
+    alpha: f32,
+    d: [f32; 2],
+    dims: [f32; 2],
+) {
+    // the rounding geo lives in pixel space; mirror the ndc transform there
+    let px_center = [
+        (center[0] + 1.0) * 0.5 * dims[0],
+        (center[1] + 1.0) * 0.5 * dims[1],
+    ];
+    let px_d = [d[0] * 0.5 * dims[0], d[1] * 0.5 * dims[1]];
     for op in ops {
         match op {
             RenderOp::Fill { pos, size, color } => {
@@ -2549,8 +2595,22 @@ fn apply_batch(ops: &mut [RenderOp], center: [f32; 2], scale: f32, alpha: f32, d
                     *opaque = false;
                 }
             }
+            RenderOp::TexR { pos, size, mul, geo_px, radius, .. } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                    geo_px[i] = px_center[i] + (geo_px[i] - px_center[i]) * scale + px_d[i];
+                    geo_px[i + 2] *= scale;
+                }
+                *radius *= scale;
+                *mul *= alpha;
+            }
         }
     }
+}
+
+fn out_dims(out: &Output) -> [f32; 2] {
+    [out.width as f32, out.height as f32]
 }
 
 fn center_ndc(out: &Output, r: Rect) -> [f32; 2] {
@@ -2652,7 +2712,7 @@ mod tests {
             size: [1.0, 1.0],
             color: [1.0; 4],
         }];
-        apply_batch(&mut ops, [0.0, 0.0], 0.5, 0.5, [0.25, 0.0]);
+        apply_batch(&mut ops, [0.0, 0.0], 0.5, 0.5, [0.25, 0.0], [1000.0, 600.0]);
         let RenderOp::Fill { pos, size, color } = &ops[0] else {
             panic!("op kind changed");
         };

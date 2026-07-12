@@ -155,6 +155,9 @@ pub struct Window {
     pub rule_immediate: Cell<bool>,
     /// window-rule `opacity`, multiplied into every sampled quad
     pub rule_opacity: Cell<Option<f32>>,
+    pub rule_rounding: Cell<Option<i32>>,
+    pub rule_shadow: Cell<Option<bool>>,
+    pub rule_dim: Cell<Option<bool>>,
     pub anims: RefCell<WinAnims>,
     /// the ops + texture keys this window produced at its last compose;
     /// the close animation seizes them when the surface goes away
@@ -197,6 +200,9 @@ impl Window {
             fullscreen: Cell::new(false),
             rule_immediate: Cell::new(false),
             rule_opacity: Cell::new(None),
+            rule_rounding: Cell::new(None),
+            rule_shadow: Cell::new(None),
+            rule_dim: Cell::new(None),
             anims: RefCell::new(WinAnims::default()),
             last_batch: RefCell::new((Vec::new(), Vec::new())),
         }
@@ -788,6 +794,9 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
     win.rule_immediate.set(fx.immediate);
     win.rule_opacity
         .set(fx.opacity.map(|o| o.clamp(0.0, 1.0) as f32));
+    win.rule_rounding.set(fx.rounding);
+    win.rule_shadow.set(fx.shadow);
+    win.rule_dim.set(fx.dim);
     // a rule can pin the window to a workspace (already 0-based) without switching to it
     let ws = fx
         .workspace

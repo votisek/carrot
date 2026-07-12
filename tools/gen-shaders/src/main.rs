@@ -1,6 +1,8 @@
-// hand-builds carrot's two spir-v modules and regenerates
-// src/render/shaders.rs. run from the repo:
-//   cargo run --manifest-path tools/gen-shaders/Cargo.toml
+// hand-builds carrot's spir-v modules and regenerates
+// src/render/shaders.rs. run from the repo (RUSTFLAGS outranks and sheds
+// the compositor's static-link target rustflags, which cargo would
+// otherwise apply to this host tool too):
+//   RUSTFLAGS=" " cargo run --manifest-path tools/gen-shaders/Cargo.toml
 //
 // no shader language anywhere - the modules are assembled instruction
 // by instruction below. the freshness test in the generated file pins
@@ -23,6 +25,19 @@ use rspirv::spirv::{
     AddressingModel, BuiltIn, Capability, Decoration, Dim, ExecutionMode, ExecutionModel,
     FunctionControl, ImageFormat, MemoryModel, StorageClass, Word,
 };
+
+// GLSL.std.450 opcodes (the extended set is frozen; numbers are spec)
+#[derive(Copy, Clone)]
+#[repr(u32)]
+enum GLOp {
+    FAbs = 4,
+    Pow = 26,
+    FMax = 40,
+    FClamp = 43,
+    FMix = 46,
+    SmoothStep = 49,
+    Length = 66,
+}
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -119,6 +134,42 @@ fn store_position(b: &mut Builder, c: &Common, pos_var: Word, v: Word) {
         .composite_construct(c.vec4, None, vec![v, c.c_f32_0, c.c_f32_1])
         .unwrap();
     b.store(pos_var, v4, None, vec![]).unwrap();
+}
+
+// one GLSL.std.450 call; operands are ids
+fn glsl(b: &mut Builder, set: Word, ty: Word, op: GLOp, args: &[Word]) -> Word {
+    let ops: Vec<Operand> = args.iter().map(|a| Operand::IdRef(*a)).collect();
+    b.ext_inst(ty, None, set, op as u32, ops).unwrap()
+}
+
+// circular rounded-rect coverage at a pixel: 1 inside, smooth aa edge.
+// frag/geo_pos/geo_size in pixels, radius > aa assumed (op-side floor)
+#[allow(clippy::too_many_arguments)]
+fn rounding_alpha(
+    b: &mut Builder,
+    c: &Common,
+    set: Word,
+    frag: Word,
+    geo_pos: Word,
+    geo_size: Word,
+    radius: Word,
+    aa: Word,
+) -> Word {
+    let c_half = b.constant_bit32(c.f32t, 0.5f32.to_bits());
+    let zero2 = b.constant_composite(c.vec2, vec![c.c_f32_0, c.c_f32_0]);
+    let half = b.vector_times_scalar(c.vec2, None, geo_size, c_half).unwrap();
+    let center = b.f_add(c.vec2, None, geo_pos, half).unwrap();
+    let rel = b.f_sub(c.vec2, None, frag, center).unwrap();
+    let absd = glsl(b, set, c.vec2, GLOp::FAbs, &[rel]);
+    let rvec = b.composite_construct(c.vec2, None, vec![radius, radius]).unwrap();
+    let inner = b.f_sub(c.vec2, None, half, rvec).unwrap();
+    let p = b.f_sub(c.vec2, None, absd, inner).unwrap();
+    let q = glsl(b, set, c.vec2, GLOp::FMax, &[p, zero2]);
+    let dist = glsl(b, set, c.f32t, GLOp::Length, &[q]);
+    let lo = b.f_sub(c.f32t, None, radius, aa).unwrap();
+    let hi = b.f_add(c.f32t, None, radius, aa).unwrap();
+    let sm = glsl(b, set, c.f32t, GLOp::SmoothStep, &[lo, hi, dist]);
+    b.f_sub(c.f32t, None, c.c_f32_1, sm).unwrap()
 }
 
 fn build_fill() -> Vec<u32> {
@@ -300,6 +351,125 @@ fn build_tex() -> Vec<u32> {
     b.module().assemble()
 }
 
+// texr push block (64 bytes): tex's five members, then
+//   vec2 geo_pos @40, vec2 geo_size @48, float radius @56, float aa @60
+// geo is the window geometry in output-local pixels; the fragment side
+// clips the sample to its rounded rect via FragCoord
+fn build_texr() -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    let set = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let c = common(&mut b);
+
+    let pc_struct = b.type_struct(vec![
+        c.vec2, c.vec2, c.vec2, c.vec2, c.f32t, c.vec2, c.vec2, c.f32t, c.f32t,
+    ]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    for (i, off) in [0u32, 8, 16, 24, 32, 40, 48, 56, 60].iter().enumerate() {
+        b.member_decorate(
+            pc_struct,
+            i as u32,
+            Decoration::Offset,
+            vec![Operand::LiteralBit32(*off)],
+        );
+    }
+    let ptr_pc = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let pc_var = b.variable(ptr_pc, None, StorageClass::PushConstant, None);
+    let ptr_pc_f32 = b.type_pointer(None, StorageClass::PushConstant, c.f32t);
+    let c_i32_3 = b.constant_bit32(c.i32t, 3);
+    let c_i32_4 = b.constant_bit32(c.i32t, 4);
+    let c_i32_5 = b.constant_bit32(c.i32t, 5);
+    let c_i32_6 = b.constant_bit32(c.i32t, 6);
+    let c_i32_7 = b.constant_bit32(c.i32t, 7);
+    let c_i32_8 = b.constant_bit32(c.i32t, 8);
+
+    let image = b.type_image(c.f32t, Dim::Dim2D, 0, 0, 0, 1, ImageFormat::Unknown, None);
+    let sampled = b.type_sampled_image(image);
+    let ptr_uc = b.type_pointer(None, StorageClass::UniformConstant, sampled);
+    let tex = b.variable(ptr_uc, None, StorageClass::UniformConstant, None);
+    b.decorate(tex, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
+    b.decorate(tex, Decoration::Binding, vec![Operand::LiteralBit32(0)]);
+
+    // vertex globals
+    let vidx = b.variable(c.ptr_in_i32, None, StorageClass::Input, None);
+    b.decorate(vidx, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::VertexIndex)]);
+    let gl_pos = b.variable(c.ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(gl_pos, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::Position)]);
+    let ptr_out_vec2 = b.type_pointer(None, StorageClass::Output, c.vec2);
+    let uv_out = b.variable(ptr_out_vec2, None, StorageClass::Output, None);
+    b.decorate(uv_out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+
+    // fragment globals
+    let ptr_in_vec2 = b.type_pointer(None, StorageClass::Input, c.vec2);
+    let uv_in = b.variable(ptr_in_vec2, None, StorageClass::Input, None);
+    b.decorate(uv_in, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let ptr_in_vec4 = b.type_pointer(None, StorageClass::Input, c.vec4);
+    let frag_coord = b.variable(ptr_in_vec4, None, StorageClass::Input, None);
+    b.decorate(
+        frag_coord,
+        Decoration::BuiltIn,
+        vec![Operand::BuiltIn(BuiltIn::FragCoord)],
+    );
+    let out_color = b.variable(c.ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(out_color, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+
+    // vs_main - identical to tex
+    let vs = b
+        .begin_function(c.void, None, FunctionControl::NONE, c.fn_void)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let ndc = corner_math(&mut b, &c, vidx, pc_var, c.c_i32_0, c.c_i32_1);
+    store_position(&mut b, &c, gl_pos, ndc);
+    let uv = corner_math(&mut b, &c, vidx, pc_var, c.c_i32_2, c_i32_3);
+    b.store(uv_out, uv, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    // fs_main - tex sample scaled by mul and the rounded-rect coverage
+    let fs = b
+        .begin_function(c.void, None, FunctionControl::NONE, c.fn_void)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let si = b.load(sampled, None, tex, None, vec![]).unwrap();
+    let uv = b.load(c.vec2, None, uv_in, None, vec![]).unwrap();
+    let texel = b
+        .image_sample_implicit_lod(c.vec4, None, si, uv, None, vec![])
+        .unwrap();
+    let mul_ptr = b.access_chain(ptr_pc_f32, None, pc_var, vec![c_i32_4]).unwrap();
+    let mul = b.load(c.f32t, None, mul_ptr, None, vec![]).unwrap();
+    let f4 = b.load(c.vec4, None, frag_coord, None, vec![]).unwrap();
+    let frag = b
+        .vector_shuffle(c.vec2, None, f4, f4, vec![0, 1])
+        .unwrap();
+    let gp_ptr = b.access_chain(c.ptr_pc_vec2, None, pc_var, vec![c_i32_5]).unwrap();
+    let geo_pos = b.load(c.vec2, None, gp_ptr, None, vec![]).unwrap();
+    let gs_ptr = b.access_chain(c.ptr_pc_vec2, None, pc_var, vec![c_i32_6]).unwrap();
+    let geo_size = b.load(c.vec2, None, gs_ptr, None, vec![]).unwrap();
+    let r_ptr = b.access_chain(ptr_pc_f32, None, pc_var, vec![c_i32_7]).unwrap();
+    let radius = b.load(c.f32t, None, r_ptr, None, vec![]).unwrap();
+    let aa_ptr = b.access_chain(ptr_pc_f32, None, pc_var, vec![c_i32_8]).unwrap();
+    let aa = b.load(c.f32t, None, aa_ptr, None, vec![]).unwrap();
+    let cover = rounding_alpha(&mut b, &c, set, frag, geo_pos, geo_size, radius, aa);
+    let k = b.f_mul(c.f32t, None, mul, cover).unwrap();
+    let scaled = b.vector_times_scalar(c.vec4, None, texel, k).unwrap();
+    b.store(out_color, scaled, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    b.entry_point(ExecutionModel::Vertex, vs, "vs_main", vec![vidx, gl_pos, uv_out]);
+    b.entry_point(
+        ExecutionModel::Fragment,
+        fs,
+        "fs_main",
+        vec![uv_in, frag_coord, out_color],
+    );
+    b.execution_mode(fs, ExecutionMode::OriginUpperLeft, vec![]);
+
+    b.module().assemble()
+}
+
 fn emit_const(out: &mut String, name: &str, words: &[u32]) {
     writeln!(out, "pub const {name}: &[u32] = &[").unwrap();
     for chunk in words.chunks(8) {
@@ -315,6 +485,7 @@ fn main() {
 
     let fill = build_fill();
     let tex = build_tex();
+    let texr = build_texr();
 
     let own_src = std::fs::read_to_string(tool_dir.join("src/main.rs")).unwrap();
     let gen_hash = hex(&Sha256::digest(own_src.as_bytes()));
@@ -328,6 +499,7 @@ fn main() {
     );
     emit_const(&mut out, "FILL", &fill);
     emit_const(&mut out, "TEX", &tex);
+    emit_const(&mut out, "TEXR", &texr);
 
     writeln!(
         out,
@@ -339,6 +511,7 @@ mod tests {{
     const GEN_SRC_HASH: &str = "{gen_hash}";
     const FILL_HASH: &str = "{fill_hash}";
     const TEX_HASH: &str = "{tex_hash}";
+    const TEXR_HASH: &str = "{texr_hash}";
     const REGEN: &str =
         "shaders out of date - rerun: cargo run --manifest-path tools/gen-shaders/Cargo.toml";
 
@@ -360,24 +533,28 @@ mod tests {{
         assert_eq!(GEN_SRC_HASH, hex(&Sha256::digest(gen_src.as_bytes())), "{{REGEN}}");
         assert_eq!(FILL_HASH, words_hash(super::FILL), "{{REGEN}}");
         assert_eq!(TEX_HASH, words_hash(super::TEX), "{{REGEN}}");
+        assert_eq!(TEXR_HASH, words_hash(super::TEXR), "{{REGEN}}");
     }}
 
     #[test]
     fn shader_words_are_spirv() {{
         assert_eq!(super::FILL[0], 0x0723_0203);
         assert_eq!(super::TEX[0], 0x0723_0203);
+        assert_eq!(super::TEXR[0], 0x0723_0203);
     }}
 }}"#,
         gen_hash = gen_hash,
         fill_hash = words_hash(&fill),
         tex_hash = words_hash(&tex),
+        texr_hash = words_hash(&texr),
     )
     .unwrap();
 
     std::fs::write(render_dir.join("shaders.rs"), out).unwrap();
     println!(
-        "wrote shaders.rs (fill {} words, tex {} words)",
+        "wrote shaders.rs (fill {} words, tex {} words, texr {} words)",
         fill.len(),
-        tex.len()
+        tex.len(),
+        texr.len()
     );
 }
