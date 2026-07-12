@@ -336,6 +336,9 @@ impl WlSurface {
         // windows on invisible workspaces keep delivering frames
         if content_changed {
             crate::protocol::image_copy_capture::content_changed(&self.client.state, self);
+            if let Some(me) = self.client.objects.surface(self.id) {
+                crate::portal::cast::surface_committed(&self.client.state, &me);
+            }
         }
         // a map/unmap under a stationary cursor changes what's hit; the
         // pointer must not wait for the next motion to notice

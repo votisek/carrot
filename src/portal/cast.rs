@@ -149,7 +149,89 @@ pub async fn start(
         _resizer: resizer,
     });
     state.casts.borrow_mut().push(cast.clone());
+    let tick = state.cast_tick.take();
+    if tick.is_some() {
+        state.cast_tick.set(tick);
+    } else {
+        // first cast ever: the tick task lives for the compositor's life
+        state
+            .cast_tick
+            .set(Some(state.eng.spawn("cast tick", tick_loop(state.clone()))));
+    }
     Ok(cast)
+}
+
+/// a commit landed: casts sourcing it while off glass go dirty and the
+/// tick owes them a frame
+pub fn surface_committed(state: &Rc<State>, surface: &Rc<crate::surface::WlSurface>) {
+    if state.casts.borrow().is_empty() {
+        return;
+    }
+    let root = surface.get_root();
+    let win = crate::tree::window_for_surface(state, &root);
+    let mut kick = false;
+    for c in state.casts.borrow().iter() {
+        if c.dead.get() || c.dirty.get() {
+            kick |= c.dirty.get();
+            continue;
+        }
+        let hit = match (&c.source, &win) {
+            (Source::Window { win: w, .. }, Some(cw)) => {
+                w.upgrade().is_some_and(|a| Rc::ptr_eq(&a, cw))
+            }
+            (Source::Workspace(i), Some(cw)) => {
+                match (crate::tree::workspace_of(state, cw), state.workspaces.borrow().get(*i)) {
+                    (Some(a), Some(b)) => Rc::ptr_eq(&a, b),
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if hit && !c.on_glass(state) {
+            c.dirty.set(true);
+            kick = true;
+        }
+    }
+    if kick {
+        state.cast_kick.trigger();
+    }
+}
+
+/// drain dirty hidden casts at their own rate; parks on the kick event
+async fn tick_loop(state: Rc<State>) {
+    loop {
+        state.cast_kick.triggered().await;
+        loop {
+            let casts: Vec<Rc<Cast>> = state.casts.borrow().clone();
+            let mut earliest: Option<u64> = None;
+            let mut sweep = false;
+            for c in casts.iter().filter(|c| c.dirty.get()) {
+                if c.dead.get() {
+                    sweep = true;
+                    continue;
+                }
+                if c.on_glass(&state) {
+                    c.dirty.set(false);
+                    continue;
+                }
+                let due = c.last.get() + c.frame_ns - c.frame_ns / 10;
+                if Time::now().nsec() < due {
+                    earliest = Some(earliest.map_or(due, |e: u64| e.min(due)));
+                    continue;
+                }
+                c.feed_hidden(&state);
+            }
+            if sweep {
+                state.casts.borrow_mut().retain(|c| !c.dead.get());
+            }
+            match earliest {
+                Some(t) => {
+                    let _ = state.ring.timeout(Time::from_nsec(t)).await;
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 fn resolve(state: &Rc<State>, pick: Pick) -> Result<(Source, u32, u32, u32, (i32, i32)), PwError> {

@@ -52,6 +52,10 @@ pub struct State {
     pub icc_sessions: RefCell<Vec<Rc<crate::protocol::image_copy_capture::IccSession>>>,
     /// live portal screencasts, fed from the present tail
     pub casts: RefCell<Vec<Rc<crate::portal::cast::Cast>>>,
+    /// a hidden-cast source committed; the cast tick task drains it
+    pub cast_kick: AsyncEvent,
+    /// the tick task, spawned with the first cast
+    pub cast_tick: std::cell::Cell<Option<SpawnedFuture<()>>>,
     /// a screencast consent click waiting on the seat
     pub cast_pick: RefCell<Option<Rc<crate::portal::PendingPick>>>,
     /// idle notifications + inhibitors; the pump task ticks deadlines
@@ -102,6 +106,8 @@ impl State {
             ext_toplevel_lists: RefCell::new(Vec::new()),
             icc_sessions: RefCell::new(Vec::new()),
             casts: RefCell::new(Vec::new()),
+            cast_kick: AsyncEvent::default(),
+            cast_tick: std::cell::Cell::new(None),
             cast_pick: RefCell::new(None),
             idle: Default::default(),
             lock: RefCell::new(None),
