@@ -176,6 +176,17 @@ pub struct WinAnims {
     pub border: Option<BorderAnim>,
     /// settled dim rides here too; never pruned
     pub dim: Option<crate::anim::Anim>,
+    pub resize: Option<ResizeAnim>,
+}
+
+/// old content crossfades into new across the animated geometry; the
+/// textures are baked/rendered at compose time and retired through state
+pub struct ResizeAnim {
+    pub anim: crate::anim::Anim, // 0 -> 1
+    pub from: (i32, i32),
+    pub from_rect: Rect,
+    pub snapshot: Option<crate::render::renderer::Texture>,
+    pub live: Option<crate::render::renderer::Texture>,
 }
 
 /// draw offset = (dx, dy) * anim.value(); the anim runs 1 -> 0
@@ -286,11 +297,57 @@ impl Window {
             return;
         }
         let first = old == Rect::default();
+        let cfg = state.config.borrow().clone();
+        // size change beyond the threshold starts (or retargets) the
+        // crossfade; the textures get built at compose time
+        let (dw, dh) = (old.width() - r.width(), old.height() - r.height());
+        if !first
+            && !self.fullscreen.get()
+            && (dw.abs() > 10 || dh.abs() > 10)
+            && self.surface().mapped.get()
+        {
+            if let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowResize) {
+                state.anim_clock.touch();
+                let now = state.anim_clock.now();
+                let mut m = self.anims.borrow_mut();
+                match &mut m.resize {
+                    Some(rz) => {
+                        let p = rz.anim.clamped_value(now);
+                        let cw = rz.from.0 as f64 + (old.width() - rz.from.0) as f64 * p;
+                        let ch = rz.from.1 as f64 + (old.height() - rz.from.1) as f64 * p;
+                        rz.from = (cw.round() as i32, ch.round() as i32);
+                        rz.anim = crate::config::build_anim(
+                            &state.anim_clock,
+                            motion,
+                            &cfg.animations,
+                            0.0,
+                            1.0,
+                            rz.anim.velocity(now),
+                        );
+                    }
+                    None => {
+                        m.resize = Some(ResizeAnim {
+                            anim: crate::config::build_anim(
+                                &state.anim_clock,
+                                motion,
+                                &cfg.animations,
+                                0.0,
+                                1.0,
+                                0.0,
+                            ),
+                            from: (old.width(), old.height()),
+                            from_rect: old,
+                            snapshot: None,
+                            live: None,
+                        });
+                    }
+                }
+            }
+        }
         let (dx, dy) = ((old.x1 - r.x1) as f64, (old.y1 - r.y1) as f64);
         if first || (dx == 0.0 && dy == 0.0) || self.fullscreen.get() {
             return;
         }
-        let cfg = state.config.borrow().clone();
         let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowMove) else {
             self.anims.borrow_mut().move_ = None;
             return;
@@ -332,6 +389,7 @@ impl Window {
         if m.move_.as_ref().is_some_and(|mv| mv.anim.is_done(now)) {
             m.move_ = None;
         }
+        // resize is pruned by the draw path, which can retire its textures
         if m.open.as_ref().is_some_and(|(a, _)| a.is_done(now)) {
             m.open = None;
         }
@@ -342,11 +400,23 @@ impl Window {
             || m.open.is_some()
             || m.border.is_some()
             || m.dim.as_ref().is_some_and(|a| !a.is_done(now))
+            || m.resize.as_ref().is_some_and(|r| !r.anim.is_done(now))
     }
 
     /// drop every animation; grabs and no-anim paths stay 1:1
-    pub fn anims_snap(&self) {
+    pub fn anims_snap(&self, state: &State) {
+        self.retire_gpu(state);
         *self.anims.borrow_mut() = WinAnims::default();
+    }
+
+    /// hand any held gpu textures to the deferred retire queue
+    pub fn retire_gpu(&self, state: &State) {
+        let mut m = self.anims.borrow_mut();
+        if let Some(rz) = &mut m.resize {
+            let mut q = state.retire_tex.borrow_mut();
+            q.extend(rz.snapshot.take());
+            q.extend(rz.live.take());
+        }
     }
 
     /// drop only the move animation; a grab must not chase its own pointer
@@ -871,7 +941,7 @@ pub fn map_window(state: &Rc<State>, win: &Rc<Window>) {
         set_fullscreen(state, win, true);
     }
     if fx.no_anim {
-        win.anims_snap();
+        win.anims_snap(state);
     } else if let Some(motion) = cfg.animations.motion(crate::config::AnimKind::WindowOpen) {
         let style = match fx.animation.clone().unwrap_or_else(|| cfg.animations.window_open.style.clone()) {
             crate::config::Style::Default => crate::config::Style::Popin { perc: 0.8 },
@@ -988,6 +1058,7 @@ pub fn unmap_window(state: &Rc<State>, win: &Rc<Window>) {
             }
         }
     }
+    win.retire_gpu(state);
     if win.floating.get() {
         ws.remove_float(win);
     } else {

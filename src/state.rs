@@ -76,6 +76,9 @@ pub struct State {
     /// frozen at each output's predicted present; all sampling agrees on
     /// when the frame will glass
     pub anim_clock: crate::anim::AnimClock,
+    /// gpu textures dropped by animations; compose drains these into the
+    /// per-output retire queue so nothing dies mid-sample
+    pub retire_tex: RefCell<Vec<crate::render::renderer::Texture>>,
     serial: NumCell<u64>,
     /// identity for cache keys: wire ids get reused, uids never do
     obj_uid: NumCell<u64>,
@@ -122,6 +125,7 @@ impl State {
             frames_in_flight: std::cell::Cell::new(0),
             dmabuf_info: RefCell::new(None),
             anim_clock: crate::anim::AnimClock::new(),
+            retire_tex: RefCell::new(Vec::new()),
             serial: NumCell::new(0),
             obj_uid: NumCell::new(0),
         })

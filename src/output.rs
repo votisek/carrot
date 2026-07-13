@@ -1877,6 +1877,9 @@ fn compose_ops(
     };
     state.anim_clock.freeze(target);
     out.anim_pending.set(false);
+    out.retired_tex
+        .borrow_mut()
+        .extend(state.retire_tex.borrow_mut().drain(..));
 
     let mut ops = Vec::new();
     let mut live: Vec<(ClientId, u64)> = Vec::new();
@@ -2381,6 +2384,149 @@ fn ws_scene(
     }
 }
 
+/// re-express screen-space ops in the local ndc of a texture covering `r`
+fn remap_local(ops: &mut [RenderOp], out: &Output, r: Rect) {
+    let (gx, gy) = out.pos.get();
+    let rx = (r.x1 - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let ry = (r.y1 - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    let rw = (r.width() as f32 / out.width as f32 * 2.0).max(1e-6);
+    let rh = (r.height() as f32 / out.height as f32 * 2.0).max(1e-6);
+    let (px, py) = ((r.x1 - gx) as f32, (r.y1 - gy) as f32);
+    let map_pos = |pos: &mut [f32; 2], size: &mut [f32; 2]| {
+        pos[0] = (pos[0] - rx) / rw * 2.0 - 1.0;
+        pos[1] = (pos[1] - ry) / rh * 2.0 - 1.0;
+        size[0] = size[0] / rw * 2.0;
+        size[1] = size[1] / rh * 2.0;
+    };
+    for op in ops {
+        match op {
+            RenderOp::Fill { pos, size, .. } => map_pos(pos, size),
+            RenderOp::Tex { pos, size, .. } => map_pos(pos, size),
+            RenderOp::TexR { pos, size, geo_px, .. } => {
+                map_pos(pos, size);
+                geo_px[0] -= px;
+                geo_px[1] -= py;
+            }
+            RenderOp::Border { pos, size, rect_px, .. } => {
+                map_pos(pos, size);
+                rect_px[0] -= px;
+                rect_px[1] -= py;
+            }
+            RenderOp::Shadow { pos, size, win_px, .. } => {
+                map_pos(pos, size);
+                win_px[0] -= px;
+                win_px[1] -= py;
+            }
+            RenderOp::Xfade { pos, size, geo_px, .. } => {
+                map_pos(pos, size);
+                geo_px[0] -= px;
+                geo_px[1] -= py;
+            }
+        }
+    }
+}
+
+/// bake/refresh the crossfade textures and emit the mixing quad; false
+/// means degrade to a plain draw (the caller snaps the anim)
+#[allow(clippy::too_many_arguments)]
+fn draw_resize_xfade(
+    state: &Rc<State>,
+    out: &Rc<Output>,
+    win: &Rc<crate::tree::Window>,
+    arect: Rect,
+    round: f32,
+    progress: f64,
+    ops: &mut Vec<RenderOp>,
+    live: &mut Vec<(ClientId, u64)>,
+) -> bool {
+    let surface = win.surface();
+    let target = win.rect.get();
+    let geo = win.geometry();
+    // current content, drawn fresh at the target size into the live side
+    let mut tmp = Vec::new();
+    let mut tl = Vec::new();
+    draw_surface_tree(
+        out,
+        &surface,
+        target.x1 - geo.x1,
+        target.y1 - geo.y1,
+        target,
+        1.0,
+        0.0,
+        &mut tmp,
+        &mut tl,
+    );
+    if tmp.is_empty() {
+        return false;
+    }
+    remap_local(&mut tmp, out, target);
+    let mut m = win.anims.borrow_mut();
+    let Some(rz) = m.resize.as_mut() else { return false };
+    // the old content bakes exactly once, from the last composed batch
+    if rz.snapshot.is_none() {
+        let (mut old_ops, _) = win.last_batch.borrow().clone();
+        if old_ops.is_empty() {
+            return false;
+        }
+        remap_local(&mut old_ops, out, rz.from_rect);
+        let (fw, fh) = (rz.from_rect.width().max(1), rz.from_rect.height().max(1));
+        let tex = match out.renderer.create_render_texture(fw as u32, fh as u32) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let ok = out
+            .renderer
+            .render_into(&tex, Some([0.0; 4]), &old_ops, Vec::new())
+            .and_then(|f| f.wait(&out.renderer));
+        if ok.is_err() {
+            state.retire_tex.borrow_mut().push(tex);
+            return false;
+        }
+        rz.snapshot = Some(tex);
+    }
+    // the live side re-renders every frame at the target dims
+    let (tw, th) = (target.width().max(1) as u32, target.height().max(1) as u32);
+    if rz.live.as_ref().is_none_or(|t| t.width != tw || t.height != th) {
+        if let Some(old) = rz.live.take() {
+            state.retire_tex.borrow_mut().push(old);
+        }
+        match out.renderer.create_render_texture(tw, th) {
+            Ok(t) => rz.live = Some(t),
+            Err(_) => return false,
+        }
+    }
+    let live_tex = rz.live.as_ref().unwrap();
+    let ok = out
+        .renderer
+        .render_into(live_tex, Some([0.0; 4]), &tmp, Vec::new())
+        .and_then(|f| f.wait(&out.renderer));
+    if ok.is_err() {
+        return false;
+    }
+    live.extend(tl);
+    let (gx, gy) = out.pos.get();
+    let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    ops.push(RenderOp::Xfade {
+        from_view: rz.snapshot.as_ref().unwrap().view,
+        to_view: live_tex.view,
+        pos: [fxp(arect.x1), fyp(arect.y1)],
+        size: [
+            arect.width() as f32 / out.width as f32 * 2.0,
+            arect.height() as f32 / out.height as f32 * 2.0,
+        ],
+        progress: progress as f32,
+        geo_px: [
+            (arect.x1 - gx) as f32,
+            (arect.y1 - gy) as f32,
+            arect.width() as f32,
+            arect.height() as f32,
+        ],
+        radius: round,
+    });
+    true
+}
+
 fn draw_window(
     state: &Rc<State>,
     out: &Rc<Output>,
@@ -2401,6 +2547,36 @@ fn draw_window(
     if win.anims_live(state.anim_clock.now()) {
         out.anim_pending.set(true);
     }
+    // a finished crossfade retires its textures; a live one shrinks the
+    // drawn rect to the animated size
+    let rz_progress = {
+        let now = state.anim_clock.now();
+        let mut m = win.anims.borrow_mut();
+        match &mut m.resize {
+            Some(rz) if rz.anim.is_done(now) => {
+                let mut q = state.retire_tex.borrow_mut();
+                q.extend(rz.snapshot.take());
+                q.extend(rz.live.take());
+                m.resize = None;
+                None
+            }
+            Some(rz) => Some((rz.anim.clamped_value(now), rz.from)),
+            None => None,
+        }
+    };
+    let rect = match rz_progress {
+        Some((p, from)) => {
+            let w = from.0 as f64 + (rect.width() - from.0) as f64 * p;
+            let h = from.1 as f64 + (rect.height() - from.1) as f64 * p;
+            Rect::new_sized_saturating(
+                rect.x1,
+                rect.y1,
+                (w.round() as i32).max(1),
+                (h.round() as i32).max(1),
+            )
+        }
+        None => rect,
+    };
     let round = if win.fullscreen.get() {
         0.0
     } else {
@@ -2456,7 +2632,23 @@ fn draw_window(
     }
     let geo = win.geometry();
     let alpha = win.rule_opacity.get().unwrap_or(1.0);
-    draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, round, ops, live);
+    let mut xfaded = false;
+    if let Some((p, _)) = rz_progress {
+        xfaded = draw_resize_xfade(state, out, win, rect, round, p, ops, live);
+        if !xfaded {
+            // degrade: snap the crossfade, draw plainly
+            let mut m = win.anims.borrow_mut();
+            if let Some(rz) = &mut m.resize {
+                let mut q = state.retire_tex.borrow_mut();
+                q.extend(rz.snapshot.take());
+                q.extend(rz.live.take());
+            }
+            m.resize = None;
+        }
+    }
+    if !xfaded {
+        draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, round, ops, live);
+    }
     if let Some(tl) = win.xdg_opt() {
         draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
     }
@@ -2510,7 +2702,9 @@ fn draw_window(
             apply_batch(&mut ops[mark..], center_ndc(out, rect), scale, alpha, d, out_dims(out));
         }
     }
-    *win.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
+    if !xfaded {
+        *win.last_batch.borrow_mut() = (ops[mark..].to_vec(), live[lmark..].to_vec());
+    }
 }
 
 // -- closing windows: the final batch outlives the surface --
@@ -2693,6 +2887,15 @@ fn apply_batch(
                 *radius *= scale;
                 *range *= scale;
                 color[3] *= alpha;
+            }
+            RenderOp::Xfade { pos, size, geo_px, radius, .. } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                    geo_px[i] = px_center[i] + (geo_px[i] - px_center[i]) * scale + px_d[i];
+                    geo_px[i + 2] *= scale;
+                }
+                *radius *= scale;
             }
         }
     }

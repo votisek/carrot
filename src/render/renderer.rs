@@ -54,6 +54,18 @@ struct ShadowPush {
 }
 
 #[repr(C)]
+struct XfadePush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    progress: f32,
+    radius: f32,
+    aa: f32,
+    _pad: f32,
+    geo_pos: [f32; 2],
+    geo_size: [f32; 2],
+}
+
+#[repr(C)]
 struct TexRPush {
     pos: [f32; 2],
     size: [f32; 2],
@@ -110,6 +122,17 @@ pub enum RenderOp {
         power: f32,
         color: [f32; 4],
     },
+    /// two textures stretched to the quad, mixed by progress, clipped to
+    /// the rounded geometry; the resize crossfade
+    Xfade {
+        from_view: vk::ImageView,
+        to_view: vk::ImageView,
+        pos: [f32; 2],
+        size: [f32; 2],
+        progress: f32,
+        geo_px: [f32; 4],
+        radius: f32,
+    },
     /// tex clipped to a rounded rect; geo/radius in output-local pixels
     TexR {
         view: vk::ImageView,
@@ -131,6 +154,7 @@ impl RenderOp {
             RenderOp::TexR { .. } => true,
             RenderOp::Border { .. } => true,
             RenderOp::Shadow { .. } => true,
+            RenderOp::Xfade { .. } => true,
         }
     }
 }
@@ -191,6 +215,7 @@ struct Pipelines {
     texr_blend: vk::Pipeline,
     border_blend: vk::Pipeline,
     shadow_blend: vk::Pipeline,
+    xfade_blend: vk::Pipeline,
 }
 
 pub struct Renderer {
@@ -200,6 +225,8 @@ pub struct Renderer {
     tex_set_layout: vk::DescriptorSetLayout,
     tex_layout: vk::PipelineLayout,
     texr_layout: vk::PipelineLayout,
+    xfade_set_layout: vk::DescriptorSetLayout,
+    xfade_layout: vk::PipelineLayout,
     border_layout: vk::PipelineLayout,
     shadow_layout: vk::PipelineLayout,
     fill_layout: vk::PipelineLayout,
@@ -259,6 +286,33 @@ impl Renderer {
             .push_constant_ranges(&texr_range);
         let texr_layout = unsafe { dev.create_pipeline_layout(&texr_layout_info, None) }?;
 
+        // two combined samplers for the crossfade
+        let b0 = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .immutable_samplers(&samplers);
+        let b1 = vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .immutable_samplers(&samplers);
+        let xf_bindings = [b0, b1];
+        let xf_set_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+            .bindings(&xf_bindings);
+        let xfade_set_layout = unsafe { dev.create_descriptor_set_layout(&xf_set_info, None) }?;
+        let xfade_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<XfadePush>() as u32)];
+        let xf_set_layouts = [xfade_set_layout];
+        let xfade_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&xf_set_layouts)
+            .push_constant_ranges(&xfade_range);
+        let xfade_layout = unsafe { dev.create_pipeline_layout(&xfade_layout_info, None) }?;
+
         let border_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .size(size_of::<BorderPush>() as u32)];
@@ -278,6 +332,7 @@ impl Renderer {
         let texr_module = create_module(dev, shaders::TEXR)?;
         let border_module = create_module(dev, shaders::BORDER)?;
         let shadow_module = create_module(dev, shaders::SHADOW)?;
+        let xfade_module = create_module(dev, shaders::XFADE)?;
         let pipes = Pipelines {
             fill_opaque: create_pipeline(dev, format, fill_module, fill_layout, false)?,
             fill_blend: create_pipeline(dev, format, fill_module, fill_layout, true)?,
@@ -286,6 +341,7 @@ impl Renderer {
             texr_blend: create_pipeline(dev, format, texr_module, texr_layout, true)?,
             border_blend: create_pipeline(dev, format, border_module, border_layout, true)?,
             shadow_blend: create_pipeline(dev, format, shadow_module, shadow_layout, true)?,
+            xfade_blend: create_pipeline(dev, format, xfade_module, xfade_layout, true)?,
         };
         unsafe {
             dev.destroy_shader_module(fill_module, None);
@@ -293,6 +349,7 @@ impl Renderer {
             dev.destroy_shader_module(texr_module, None);
             dev.destroy_shader_module(border_module, None);
             dev.destroy_shader_module(shadow_module, None);
+            dev.destroy_shader_module(xfade_module, None);
         }
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -310,6 +367,8 @@ impl Renderer {
             tex_set_layout,
             tex_layout,
             texr_layout,
+            xfade_set_layout,
+            xfade_layout,
             border_layout,
             shadow_layout,
             fill_layout,
@@ -444,6 +503,7 @@ impl Renderer {
                 (RenderOp::TexR { .. }, _) => (self.pipes.texr_blend, self.texr_layout),
                 (RenderOp::Border { .. }, _) => (self.pipes.border_blend, self.border_layout),
                 (RenderOp::Shadow { .. }, _) => (self.pipes.shadow_blend, self.shadow_layout),
+                (RenderOp::Xfade { .. }, _) => (self.pipes.xfade_blend, self.xfade_layout),
             };
             unsafe {
                 if pipe != bound {
@@ -496,6 +556,50 @@ impl Renderer {
                             uv_pos: *uv_pos,
                             uv_size: *uv_size,
                             mul: *mul,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::Xfade { from_view, to_view, pos, size, progress, geo_px, radius } => {
+                        let infos0 = [vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*from_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        let infos1 = [vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*to_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        let writes = [
+                            vk::WriteDescriptorSet::default()
+                                .dst_binding(0)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(&infos0),
+                            vk::WriteDescriptorSet::default()
+                                .dst_binding(1)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(&infos1),
+                        ];
+                        self.core.ext_push_desc.cmd_push_descriptor_set(
+                            cb,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            layout,
+                            0,
+                            &writes,
+                        );
+                        let pc = XfadePush {
+                            pos: *pos,
+                            size: *size,
+                            progress: *progress,
+                            radius: radius.max(0.0),
+                            aa: 0.7,
+                            _pad: 0.0,
+                            geo_pos: [geo_px[0], geo_px[1]],
+                            geo_size: [geo_px[2], geo_px[3]],
                         };
                         dev.cmd_push_constants(
                             cb,
