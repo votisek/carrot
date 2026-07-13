@@ -339,6 +339,26 @@ impl Strip {
         }
     }
 
+    /// exchange two tiles wherever they sit; slots keep their weights
+    pub fn swap_tiles(&self, a: &Window, b: &Window) -> bool {
+        let (Some((ca, ta)), Some((cb, tb))) = (self.locate(a), self.locate(b)) else {
+            return false;
+        };
+        if ca == cb {
+            if ta == tb {
+                return false;
+            }
+            self.cols.borrow_mut()[ca].tiles.swap(ta, tb);
+            return true;
+        }
+        let mut cols = self.cols.borrow_mut();
+        let wa = cols[ca].tiles[ta].clone();
+        let wb = cols[cb].tiles[tb].clone();
+        cols[ca].tiles[ta] = wb;
+        cols[cb].tiles[tb] = wa;
+        true
+    }
+
     pub fn swap_dir(&self, win: &Window, dir: Dir) -> bool {
         let Some((ci, ti)) = self.locate(win) else {
             return false;
@@ -714,6 +734,23 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!((r2.x1, r2.x2), (250, 750));
+    }
+
+    #[test]
+    fn swap_tiles_exchanges_arbitrary_pairs() {
+        let (_st, w) = setup(3);
+        let s = Strip::default();
+        s.insert(&w[0], &cfg());
+        s.insert(&w[1], &cfg());
+        assert!(s.consume_or_expel(&w[1], true)); // column 0: [w0, w1]
+        s.insert(&w[2], &cfg()); // column 1: [w2]
+        assert!(s.swap_tiles(&w[0], &w[2]), "across columns");
+        let rects = s.layout(area(), &cfg());
+        let r0 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[0])).unwrap().1;
+        let r2 = rects.iter().find(|(win, _)| Rc::ptr_eq(win, &w[2])).unwrap().1;
+        assert!(r0.x1 > r2.x1, "w0 moved into the right column");
+        assert!(s.swap_tiles(&w[2], &w[1]), "within a column");
+        assert!(!s.swap_tiles(&w[0], &w[0]));
     }
 
     #[test]

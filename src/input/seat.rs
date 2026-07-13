@@ -1442,9 +1442,9 @@ impl SeatGlobal {
     }
 
     pub fn start_move_grab(&self, win: Rc<crate::tree::Window>) {
-        // tiled windows have no free position; moving them wants a tree
-        // swap that does not exist yet
-        if !win.floating.get() || win.fullscreen.get() {
+        // floating windows follow the pointer; tiled ones trade places
+        // with whatever it crosses
+        if win.fullscreen.get() {
             return;
         }
         let start = (self.ptr_x.get(), self.ptr_y.get());
@@ -1471,19 +1471,26 @@ impl SeatGlobal {
         enum Op {
             SetRect(Rc<crate::tree::Window>, crate::rect::Rect),
             Ratio(Rc<crate::tree::Window>, u32, f64, f64),
+            /// dragging a tiled window: trade places with whatever the
+            /// pointer crosses; the move animations carry the exchange
+            Swap(Rc<crate::tree::Window>),
         }
         let op = {
             let mut slot = self.grab.borrow_mut();
             match slot.as_mut() {
                 Some(PointerGrab::Move { win, start, rect }) => {
-                    let (sw, sh) = crate::tree::output_extent(state);
-                    let nx = ((rect.x1 as f64 + x - start.0) as i32)
-                        .min(sw - rect.width())
-                        .max(0);
-                    let ny = ((rect.y1 as f64 + y - start.1) as i32)
-                        .min(sh - rect.height())
-                        .max(0);
-                    Op::SetRect(win.clone(), rect.move_(nx - rect.x1, ny - rect.y1))
+                    if win.floating.get() {
+                        let (sw, sh) = crate::tree::output_extent(state);
+                        let nx = ((rect.x1 as f64 + x - start.0) as i32)
+                            .min(sw - rect.width())
+                            .max(0);
+                        let ny = ((rect.y1 as f64 + y - start.1) as i32)
+                            .min(sh - rect.height())
+                            .max(0);
+                        Op::SetRect(win.clone(), rect.move_(nx - rect.x1, ny - rect.y1))
+                    } else {
+                        Op::Swap(win.clone())
+                    }
                 }
                 Some(PointerGrab::Resize { win, edges, start, rect, last }) => {
                     if win.floating.get() {
@@ -1499,13 +1506,14 @@ impl SeatGlobal {
             }
         };
         let win = match &op {
-            Op::SetRect(w, _) | Op::Ratio(w, ..) => w.clone(),
+            Op::SetRect(w, _) | Op::Ratio(w, ..) | Op::Swap(w) => w.clone(),
         };
         // the window left the tree mid-grab (unmap, workspace move)
         let Some(ws) = crate::tree::workspace_of(state, &win) else {
             self.grab.borrow_mut().take();
             return;
         };
+        let mut animate = false;
         match op {
             Op::SetRect(_, r) => {
                 win.rect.set(r);
@@ -1525,11 +1533,48 @@ impl SeatGlobal {
                     return;
                 }
             }
+            Op::Swap(_) => {
+                let Some((other, ..)) = crate::tree::window_at(state, x as i32, y as i32) else {
+                    return;
+                };
+                if Rc::ptr_eq(&other, &win) || other.floating.get() || other.fullscreen.get() {
+                    return;
+                }
+                let ows = crate::tree::workspace_of(state, &other)
+                    .unwrap_or_else(|| crate::tree::active(state));
+                let swapped = if Rc::ptr_eq(&ws, &ows) {
+                    match ws.tiling.mode() {
+                        crate::config::LayoutMode::Dwindle => {
+                            crate::tree::dwindle::swap_windows(&win, &other)
+                        }
+                        crate::config::LayoutMode::Scrolling => {
+                            ws.tiling.strip.swap_tiles(&win, &other)
+                        }
+                    }
+                } else if ws.tiling.mode() == crate::config::LayoutMode::Dwindle
+                    && ows.tiling.mode() == crate::config::LayoutMode::Dwindle
+                {
+                    // across outputs: leaves trade occupants tree-to-tree
+                    crate::tree::dwindle::swap_windows(&win, &other)
+                } else {
+                    false
+                };
+                if !swapped {
+                    return;
+                }
+                ws.tiling.note_focus_win(&win);
+                if !Rc::ptr_eq(&ws, &ows) {
+                    crate::tree::relayout(state, &ows);
+                }
+                animate = true;
+            }
         }
         crate::tree::relayout(state, &ws);
-        // a live drag relayouts per motion event; chasing that target would
-        // rubber-band the whole workspace behind the pointer
-        ws.tiling.for_each(|w| w.move_snap());
+        if !animate {
+            // a live drag relayouts per motion event; chasing that target
+            // would rubber-band the whole workspace behind the pointer
+            ws.tiling.for_each(|w| w.move_snap());
+        }
         state.damage.trigger();
     }
 

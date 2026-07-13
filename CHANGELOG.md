@@ -71,3 +71,4 @@
 - Offscreen Sampled Render Targets
 - Pointer Move/Resize Actions (Key or Mouse-Chord Grabs)
 - Kawase Blur (Backdrop Cache, Per-Window and Per-Layer Rules)
+- Tiled Drag-and-Swap (Pointer Grabs Trade Window Slots, Cross-Output on Dwindle)
