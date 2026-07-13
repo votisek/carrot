@@ -528,14 +528,8 @@ impl XdgSurface {
             XdgExt::Toplevel(tl) => {
                 let (w, h) = tl.desired.get();
                 let states = tl.states_bytes();
-                // size changes are load-bearing; catch a spurious one mid-drag
                 if tl.last_logged.replace((w, h)) != (w, h) {
-                    eprintln!(
-                        "carrot: configure {}x{} -> \"{}\"",
-                        w,
-                        h,
-                        tl.title.borrow()
-                    );
+                    crate::trace!("configure {}x{} -> {}", w, h, tl.title.borrow());
                 }
                 self.client.event(|o| {
                     xdg_toplevel::configure::send(o, tl.id, w, h, &states);
@@ -906,7 +900,11 @@ impl XdgToplevel {
     }
 
     pub fn configure_size(&self, w: i32, h: i32) {
-        self.desired.set((w, h));
+        // state-only changes schedule directly; an unchanged size is a
+        // no-op, not a configure broadcast
+        if self.desired.replace((w, h)) == (w, h) {
+            return;
+        }
         self.xdg.schedule_configure();
     }
 
@@ -990,7 +988,7 @@ impl xdg_toplevel::Handler for XdgToplevel {
             return Ok(());
         };
         if seat.move_resize_grab_valid(&self.xdg.surface, req.serial) {
-            seat.start_move_grab(win);
+            seat.start_move_grab(&self.client.state, win);
         }
         Ok(())
     }
@@ -1010,7 +1008,7 @@ impl xdg_toplevel::Handler for XdgToplevel {
             return Ok(());
         };
         if seat.move_resize_grab_valid(&self.xdg.surface, req.serial) {
-            seat.start_resize_grab(win, req.edges);
+            seat.start_resize_grab(&self.client.state, win, req.edges);
         }
         Ok(())
     }

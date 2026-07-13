@@ -79,6 +79,9 @@ pub struct State {
     /// gpu textures dropped by animations; compose drains these into the
     /// per-output retire queue so nothing dies mid-sample
     pub retire_tex: RefCell<Vec<crate::render::renderer::Texture>>,
+    /// an interactive move/resize grab is live; targets track 1:1 and no
+    /// animation may spawn or retarget from its relayouts
+    pub grab_active: std::cell::Cell<bool>,
     serial: NumCell<u64>,
     /// identity for cache keys: wire ids get reused, uids never do
     obj_uid: NumCell<u64>,
@@ -126,6 +129,7 @@ impl State {
             dmabuf_info: RefCell::new(None),
             anim_clock: crate::anim::AnimClock::new(),
             retire_tex: RefCell::new(Vec::new()),
+            grab_active: std::cell::Cell::new(false),
             serial: NumCell::new(0),
             obj_uid: NumCell::new(0),
         })

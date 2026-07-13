@@ -553,10 +553,13 @@ impl Renderer {
                 }
                 match op {
                     RenderOp::Fill { pos, size, color } => {
+                        // the blend is premultiplied-over; straight alpha
+                        // would glow additively during fades
+                        let a = color[3];
                         let pc = FillPush {
                             pos: *pos,
                             size: *size,
-                            color: *color,
+                            color: [color[0] * a, color[1] * a, color[2] * a, a],
                         };
                         dev.cmd_push_constants(
                             cb,
@@ -668,7 +671,7 @@ impl Renderer {
                             pos: *pos,
                             size: *size,
                             progress: *progress,
-                            radius: radius.max(0.0),
+                            radius: radius.max(1.0),
                             aa: 0.7,
                             _pad: 0.0,
                             geo_pos: [geo_px[0], geo_px[1]],
@@ -683,15 +686,18 @@ impl Renderer {
                         );
                     }
                     RenderOp::Border { pos, size, rect_px, radius, width, color } => {
+                        let a = color[3];
                         let pc = BorderPush {
                             pos: *pos,
                             size: *size,
                             rect_px: *rect_px,
-                            radius: radius.max(0.0),
+                            // below one pixel the aa band eats the whole
+                            // interior and coverage collapses to ~0.5
+                            radius: radius.max(1.0),
                             width: *width,
                             aa: 0.7,
                             _pad: 0.0,
-                            color: *color,
+                            color: [color[0] * a, color[1] * a, color[2] * a, a],
                         };
                         dev.cmd_push_constants(
                             cb,
@@ -706,7 +712,7 @@ impl Renderer {
                             pos: *pos,
                             size: *size,
                             win_px: *win_px,
-                            radius: radius.max(0.0),
+                            radius: radius.max(1.0),
                             range: range.max(1.0),
                             power: *power,
                             aa: 0.7,

@@ -2999,7 +2999,7 @@ fn draw_closing_list(
         let (scale, alpha, d) = match &c.style {
             Style::Fade => (1.0, p as f32, [0.0, 0.0]),
             Style::Slide { dir } => (1.0, 1.0, slide_delta(out, c.rect, *dir, 1.0 - p)),
-            // popin and everything else: shrink toward 80% while fading
+            Style::Popin { perc } => ((perc + (1.0 - perc) * p) as f32, p as f32, [0.0, 0.0]),
             _ => ((0.8 + 0.2 * p) as f32, p as f32, [0.0, 0.0]),
         };
         apply_batch(&mut ops[mark..], center_ndc(out, c.rect), scale, alpha, d, out_dims(out));

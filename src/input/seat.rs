@@ -1441,7 +1441,7 @@ impl SeatGlobal {
             .is_some_and(|f| Rc::ptr_eq(&f.get_root(), &origin.get_root()))
     }
 
-    pub fn start_move_grab(&self, win: Rc<crate::tree::Window>) {
+    pub fn start_move_grab(&self, state: &Rc<State>, win: Rc<crate::tree::Window>) {
         // floating windows follow the pointer; tiled ones trade places
         // with whatever it crosses
         if win.fullscreen.get() {
@@ -1449,15 +1449,17 @@ impl SeatGlobal {
         }
         let start = (self.ptr_x.get(), self.ptr_y.get());
         let rect = win.rect.get();
+        state.grab_active.set(true);
         *self.grab.borrow_mut() = Some(PointerGrab::Move { win, start, rect });
     }
 
-    pub fn start_resize_grab(&self, win: Rc<crate::tree::Window>, edges: u32) {
+    pub fn start_resize_grab(&self, state: &Rc<State>, win: Rc<crate::tree::Window>, edges: u32) {
         if win.fullscreen.get() {
             return;
         }
         let start = (self.ptr_x.get(), self.ptr_y.get());
         let rect = win.rect.get();
+        state.grab_active.set(true);
         *self.grab.borrow_mut() = Some(PointerGrab::Resize {
             win,
             edges,
@@ -1511,6 +1513,7 @@ impl SeatGlobal {
         // the window left the tree mid-grab (unmap, workspace move)
         let Some(ws) = crate::tree::workspace_of(state, &win) else {
             self.grab.borrow_mut().take();
+            state.grab_active.set(false);
             return;
         };
         let mut animate = false;
@@ -1570,16 +1573,12 @@ impl SeatGlobal {
             }
         }
         crate::tree::relayout(state, &ws);
-        if !animate {
-            // a live drag relayouts per motion event; chasing that target
-            // would rubber-band the whole workspace behind the pointer
-            ws.tiling.for_each(|w| w.move_snap());
-        }
         state.damage.trigger();
     }
 
     fn end_grab(self: &Rc<Self>, state: &Rc<State>) {
         self.grab.borrow_mut().take();
+        state.grab_active.set(false);
         // the pointer re-enters whatever it is over
         let usec = crate::util::Time::now().nsec() / 1_000;
         self.pointer_motion(state, usec, 0.0, 0.0, 0.0, 0.0);

@@ -281,7 +281,7 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
             if let Some(seat) = state.seat.borrow().clone() {
                 let (x, y) = (seat.ptr_x.get() as i32, seat.ptr_y.get() as i32);
                 if let Some((win, ..)) = crate::tree::window_at(state, x, y) {
-                    seat.start_move_grab(win);
+                    seat.start_move_grab(state, win);
                 }
             }
         }
@@ -293,7 +293,7 @@ pub fn dispatch_action(state: &Rc<State>, action: &Action) {
                     let r = win.rect.get();
                     let edges = if x < (r.x1 + r.x2) / 2 { EDGE_LEFT } else { EDGE_RIGHT }
                         | if y < (r.y1 + r.y2) / 2 { EDGE_TOP } else { EDGE_BOTTOM };
-                    seat.start_resize_grab(win, edges);
+                    seat.start_resize_grab(state, win, edges);
                 }
             }
         }

@@ -294,8 +294,27 @@ impl Window {
 
     /// target rect write + move-anim bookkeeping; every layout path uses this
     pub fn set_rect_animated(&self, state: &State, r: Rect) {
+        self.set_rect_animated_bias(state, r, 0.0);
+    }
+
+    /// view_dx: apparent horizontal movement owed to a strip scroll; the
+    /// view animation carries that share, move anims only the remainder
+    pub fn set_rect_animated_bias(&self, state: &State, r: Rect, view_dx: f64) {
         let old = self.rect.replace(r);
         if old == r {
+            return;
+        }
+        // a live grab tracks 1:1: no anims spawn, in-flight ones drop so
+        // nothing chases the pointer
+        if state.grab_active.get() {
+            let mut m = self.anims.borrow_mut();
+            m.move_ = None;
+            if let Some(rz) = &mut m.resize {
+                let mut q = state.retire_tex.borrow_mut();
+                q.extend(rz.snapshot.take());
+                q.extend(rz.live.take());
+            }
+            m.resize = None;
             return;
         }
         let first = old == Rect::default();
@@ -346,7 +365,7 @@ impl Window {
                 }
             }
         }
-        let (dx, dy) = ((old.x1 - r.x1) as f64, (old.y1 - r.y1) as f64);
+        let (dx, dy) = ((old.x1 - r.x1) as f64 - view_dx, (old.y1 - r.y1) as f64);
         if first || (dx == 0.0 && dy == 0.0) || self.fullscreen.get() {
             return;
         }
@@ -1205,8 +1224,12 @@ pub fn relayout(state: &Rc<State>, ws: &Workspace) {
         }
         crate::config::LayoutMode::Scrolling => {
             let old_view = ws.tiling.strip.view_px();
-            for (win, raw) in ws.tiling.strip.layout(area, &cfg.layout.scrolling) {
-                win.set_rect_animated(state, apply_gaps(raw, area, &cfg));
+            let rects = ws.tiling.strip.layout(area, &cfg.layout.scrolling);
+            // the scroll itself draws as one strip translate; feeding it
+            // into per-window move anims would animate the delta twice
+            let view_dx = old_view - ws.tiling.strip.view_px();
+            for (win, raw) in rects {
+                win.set_rect_animated_bias(state, apply_gaps(raw, area, &cfg), view_dx);
                 if !win.fullscreen.get() {
                     win.configure_rect();
                 }
