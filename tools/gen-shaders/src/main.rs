@@ -142,10 +142,10 @@ fn glsl(b: &mut Builder, set: Word, ty: Word, op: GLOp, args: &[Word]) -> Word {
     b.ext_inst(ty, None, set, op as u32, ops).unwrap()
 }
 
-// circular rounded-rect coverage at a pixel: 1 inside, smooth aa edge.
-// frag/geo_pos/geo_size in pixels, radius > aa assumed (op-side floor)
-#[allow(clippy::too_many_arguments)]
-fn rounding_alpha(
+// corner-space distance of a pixel from a rounded rect's inner corner
+// circle: 0 everywhere inside the straight edges, rising through `radius`
+// at the rounded corner arc. frag/geo in pixels.
+fn rounded_dist(
     b: &mut Builder,
     c: &Common,
     set: Word,
@@ -153,7 +153,6 @@ fn rounding_alpha(
     geo_pos: Word,
     geo_size: Word,
     radius: Word,
-    aa: Word,
 ) -> Word {
     let c_half = b.constant_bit32(c.f32t, 0.5f32.to_bits());
     let zero2 = b.constant_composite(c.vec2, vec![c.c_f32_0, c.c_f32_0]);
@@ -165,7 +164,23 @@ fn rounding_alpha(
     let inner = b.f_sub(c.vec2, None, half, rvec).unwrap();
     let p = b.f_sub(c.vec2, None, absd, inner).unwrap();
     let q = glsl(b, set, c.vec2, GLOp::FMax, &[p, zero2]);
-    let dist = glsl(b, set, c.f32t, GLOp::Length, &[q]);
+    glsl(b, set, c.f32t, GLOp::Length, &[q])
+}
+
+// circular rounded-rect coverage at a pixel: 1 inside, smooth aa edge.
+// radius > aa assumed (op-side floor)
+#[allow(clippy::too_many_arguments)]
+fn rounding_alpha(
+    b: &mut Builder,
+    c: &Common,
+    set: Word,
+    frag: Word,
+    geo_pos: Word,
+    geo_size: Word,
+    radius: Word,
+    aa: Word,
+) -> Word {
+    let dist = rounded_dist(b, c, set, frag, geo_pos, geo_size, radius);
     let lo = b.f_sub(c.f32t, None, radius, aa).unwrap();
     let hi = b.f_add(c.f32t, None, radius, aa).unwrap();
     let sm = glsl(b, set, c.f32t, GLOp::SmoothStep, &[lo, hi, dist]);
@@ -470,6 +485,209 @@ fn build_texr() -> Vec<u32> {
     b.module().assemble()
 }
 
+// shared skeleton for the fragcoord-driven single-quad effects: declares
+// the push block, fragcoord, gl_pos/vertex index, runs the vertex side,
+// and hands the fs body builder every loaded push member id
+struct FxShader {
+    b: Builder,
+    c: Common,
+    set: Word,
+    pc_var: Word,
+    frag_coord: Word,
+    out_color: Word,
+    vs: Word,
+    vidx: Word,
+    gl_pos: Word,
+    fs_fn: Word,
+}
+
+// members: (offset, is vec4?) - f32 otherwise, vec2 for the leading two
+fn fx_shader(offsets: &[(u32, u8)]) -> FxShader {
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    let set = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let c = common(&mut b);
+    let members: Vec<Word> = offsets
+        .iter()
+        .map(|(_, kind)| match kind {
+            2 => c.vec2,
+            4 => c.vec4,
+            _ => c.f32t,
+        })
+        .collect();
+    let pc_struct = b.type_struct(members);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    for (i, (off, _)) in offsets.iter().enumerate() {
+        b.member_decorate(
+            pc_struct,
+            i as u32,
+            Decoration::Offset,
+            vec![Operand::LiteralBit32(*off)],
+        );
+    }
+    let ptr_pc = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let pc_var = b.variable(ptr_pc, None, StorageClass::PushConstant, None);
+
+    let vidx = b.variable(c.ptr_in_i32, None, StorageClass::Input, None);
+    b.decorate(vidx, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::VertexIndex)]);
+    let gl_pos = b.variable(c.ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(gl_pos, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::Position)]);
+    let ptr_in_vec4 = b.type_pointer(None, StorageClass::Input, c.vec4);
+    let frag_coord = b.variable(ptr_in_vec4, None, StorageClass::Input, None);
+    b.decorate(
+        frag_coord,
+        Decoration::BuiltIn,
+        vec![Operand::BuiltIn(BuiltIn::FragCoord)],
+    );
+    let out_color = b.variable(c.ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(out_color, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+
+    let vs = b
+        .begin_function(c.void, None, FunctionControl::NONE, c.fn_void)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let ndc = corner_math(&mut b, &c, vidx, pc_var, c.c_i32_0, c.c_i32_1);
+    store_position(&mut b, &c, gl_pos, ndc);
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    FxShader { b, c, set, pc_var, frag_coord, out_color, vs, vidx, gl_pos, fs_fn: 0 }
+}
+
+impl FxShader {
+    fn begin_fs(&mut self) -> Word {
+        self.fs_fn = self
+            .b
+            .begin_function(self.c.void, None, FunctionControl::NONE, self.c.fn_void)
+            .unwrap();
+        self.b.begin_block(None).unwrap();
+        let f4 = self
+            .b
+            .load(self.c.vec4, None, self.frag_coord, None, vec![])
+            .unwrap();
+        self.b
+            .vector_shuffle(self.c.vec2, None, f4, f4, vec![0, 1])
+            .unwrap()
+    }
+
+    fn load_member(&mut self, idx: u32, kind: u8) -> Word {
+        let b = &mut self.b;
+        let mi = b.constant_bit32(self.c.i32t, idx as i32 as u32);
+        let (ty, ptr_ty) = match kind {
+            2 => (self.c.vec2, self.c.ptr_pc_vec2),
+            4 => {
+                let p = b.type_pointer(None, StorageClass::PushConstant, self.c.vec4);
+                (self.c.vec4, p)
+            }
+            _ => {
+                let p = b.type_pointer(None, StorageClass::PushConstant, self.c.f32t);
+                (self.c.f32t, p)
+            }
+        };
+        let ptr = b.access_chain(ptr_ty, None, self.pc_var, vec![mi]).unwrap();
+        b.load(ty, None, ptr, None, vec![]).unwrap()
+    }
+
+    fn finish(mut self, out: Word) -> Vec<u32> {
+        self.b.store(self.out_color, out, None, vec![]).unwrap();
+        self.b.ret().unwrap();
+        self.b.end_function().unwrap();
+        self.b.entry_point(
+            ExecutionModel::Vertex,
+            self.vs,
+            "vs_main",
+            vec![self.vidx, self.gl_pos],
+        );
+        self.b.entry_point(
+            ExecutionModel::Fragment,
+            self.fs_fn,
+            "fs_main",
+            vec![self.frag_coord, self.out_color],
+        );
+        self.b
+            .execution_mode(self.fs_fn, ExecutionMode::OriginUpperLeft, vec![]);
+        self.b.module().assemble()
+    }
+}
+
+// border push block (64 bytes): vec2 dst_pos @0, vec2 dst_size @8 (ndc
+// quad incl. aa margin), vec4 rect_px @16 (outer rounded rect, px),
+// float radius @32, float width @36, float aa @40, vec4 color @48.
+// ring = outer coverage minus the width-inset inner coverage; width past
+// half the rect degenerates the inner rect and the ring becomes a fill
+fn build_border() -> Vec<u32> {
+    let mut fx = fx_shader(&[(0, 2), (8, 2), (16, 4), (32, 1), (36, 1), (40, 1), (48, 4)]);
+    let frag = fx.begin_fs();
+    let rect = fx.load_member(2, 4);
+    let radius = fx.load_member(3, 1);
+    let width = fx.load_member(4, 1);
+    let aa = fx.load_member(5, 1);
+    let color = fx.load_member(6, 4);
+    let (b, c, set) = (&mut fx.b, &fx.c, fx.set);
+    let rp = b.vector_shuffle(c.vec2, None, rect, rect, vec![0, 1]).unwrap();
+    let rs = b.vector_shuffle(c.vec2, None, rect, rect, vec![2, 3]).unwrap();
+    let outer = rounding_alpha(b, c, set, frag, rp, rs, radius, aa);
+    let wvec = b.composite_construct(c.vec2, None, vec![width, width]).unwrap();
+    let two = b.constant_bit32(c.f32t, 2.0f32.to_bits());
+    let ip = b.f_add(c.vec2, None, rp, wvec).unwrap();
+    let w2 = b.f_mul(c.f32t, None, width, two).unwrap();
+    let w2v = b.composite_construct(c.vec2, None, vec![w2, w2]).unwrap();
+    let is = b.f_sub(c.vec2, None, rs, w2v).unwrap();
+    let rin0 = b.f_sub(c.f32t, None, radius, width).unwrap();
+    let rin = glsl(b, set, c.f32t, GLOp::FMax, &[rin0, c.c_f32_0]);
+    let inner = rounding_alpha(b, c, set, frag, ip, is, rin, aa);
+    let ring0 = b.f_sub(c.f32t, None, outer, inner).unwrap();
+    let ring = glsl(b, set, c.f32t, GLOp::FClamp, &[ring0, c.c_f32_0, c.c_f32_1]);
+    let out = b.vector_times_scalar(c.vec4, None, color, ring).unwrap();
+    fx.finish(out)
+}
+
+// shadow push block (64 bytes): vec2 dst_pos @0, vec2 dst_size @8,
+// vec4 win_px @16 (the window's rounded rect, px, already offset),
+// float radius @32, float range @36, float power @40, float aa @44,
+// vec4 color @48. halo = pow(clamp(1-(d-radius)/range, 0, 1), power)
+// outside the body, cut to nothing under the window; premultiplied out
+fn build_shadow() -> Vec<u32> {
+    let mut fx = fx_shader(&[
+        (0, 2),
+        (8, 2),
+        (16, 4),
+        (32, 1),
+        (36, 1),
+        (40, 1),
+        (44, 1),
+        (48, 4),
+    ]);
+    let frag = fx.begin_fs();
+    let win = fx.load_member(2, 4);
+    let radius = fx.load_member(3, 1);
+    let range = fx.load_member(4, 1);
+    let power = fx.load_member(5, 1);
+    let aa = fx.load_member(6, 1);
+    let color = fx.load_member(7, 4);
+    let (b, c, set) = (&mut fx.b, &fx.c, fx.set);
+    let wp = b.vector_shuffle(c.vec2, None, win, win, vec![0, 1]).unwrap();
+    let ws = b.vector_shuffle(c.vec2, None, win, win, vec![2, 3]).unwrap();
+    let d = rounded_dist(b, c, set, frag, wp, ws, radius);
+    let past = b.f_sub(c.f32t, None, d, radius).unwrap();
+    let frac = b.f_div(c.f32t, None, past, range).unwrap();
+    let fall0 = b.f_sub(c.f32t, None, c.c_f32_1, frac).unwrap();
+    let fall = glsl(b, set, c.f32t, GLOp::FClamp, &[fall0, c.c_f32_0, c.c_f32_1]);
+    let halo = glsl(b, set, c.f32t, GLOp::Pow, &[fall, power]);
+    // nothing under the window body
+    let lo = b.f_sub(c.f32t, None, radius, aa).unwrap();
+    let hi = b.f_add(c.f32t, None, radius, aa).unwrap();
+    let cut = glsl(b, set, c.f32t, GLOp::SmoothStep, &[lo, hi, d]);
+    let a0 = b.f_mul(c.f32t, None, halo, cut).unwrap();
+    let ca = b.composite_extract(c.f32t, None, color, vec![3]).unwrap();
+    let k = b.f_mul(c.f32t, None, a0, ca).unwrap();
+    let scaled = b.vector_times_scalar(c.vec4, None, color, k).unwrap();
+    let out = b.composite_insert(c.vec4, None, k, scaled, vec![3]).unwrap();
+    fx.finish(out)
+}
+
 fn emit_const(out: &mut String, name: &str, words: &[u32]) {
     writeln!(out, "pub const {name}: &[u32] = &[").unwrap();
     for chunk in words.chunks(8) {
@@ -486,6 +704,8 @@ fn main() {
     let fill = build_fill();
     let tex = build_tex();
     let texr = build_texr();
+    let border = build_border();
+    let shadow = build_shadow();
 
     let own_src = std::fs::read_to_string(tool_dir.join("src/main.rs")).unwrap();
     let gen_hash = hex(&Sha256::digest(own_src.as_bytes()));
@@ -500,6 +720,8 @@ fn main() {
     emit_const(&mut out, "FILL", &fill);
     emit_const(&mut out, "TEX", &tex);
     emit_const(&mut out, "TEXR", &texr);
+    emit_const(&mut out, "BORDER", &border);
+    emit_const(&mut out, "SHADOW", &shadow);
 
     writeln!(
         out,
@@ -512,6 +734,8 @@ mod tests {{
     const FILL_HASH: &str = "{fill_hash}";
     const TEX_HASH: &str = "{tex_hash}";
     const TEXR_HASH: &str = "{texr_hash}";
+    const BORDER_HASH: &str = "{border_hash}";
+    const SHADOW_HASH: &str = "{shadow_hash}";
     const REGEN: &str =
         "shaders out of date - rerun: cargo run --manifest-path tools/gen-shaders/Cargo.toml";
 
@@ -534,6 +758,8 @@ mod tests {{
         assert_eq!(FILL_HASH, words_hash(super::FILL), "{{REGEN}}");
         assert_eq!(TEX_HASH, words_hash(super::TEX), "{{REGEN}}");
         assert_eq!(TEXR_HASH, words_hash(super::TEXR), "{{REGEN}}");
+        assert_eq!(BORDER_HASH, words_hash(super::BORDER), "{{REGEN}}");
+        assert_eq!(SHADOW_HASH, words_hash(super::SHADOW), "{{REGEN}}");
     }}
 
     #[test]
@@ -541,20 +767,22 @@ mod tests {{
         assert_eq!(super::FILL[0], 0x0723_0203);
         assert_eq!(super::TEX[0], 0x0723_0203);
         assert_eq!(super::TEXR[0], 0x0723_0203);
+        assert_eq!(super::BORDER[0], 0x0723_0203);
+        assert_eq!(super::SHADOW[0], 0x0723_0203);
     }}
 }}"#,
         gen_hash = gen_hash,
         fill_hash = words_hash(&fill),
         tex_hash = words_hash(&tex),
         texr_hash = words_hash(&texr),
+        border_hash = words_hash(&border),
+        shadow_hash = words_hash(&shadow),
     )
     .unwrap();
 
     std::fs::write(render_dir.join("shaders.rs"), out).unwrap();
     println!(
-        "wrote shaders.rs (fill {} words, tex {} words, texr {} words)",
-        fill.len(),
-        tex.len(),
-        texr.len()
+        "wrote shaders.rs ({} modules)",
+        5
     );
 }

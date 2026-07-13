@@ -2401,6 +2401,45 @@ fn draw_window(
     if win.anims_live(state.anim_clock.now()) {
         out.anim_pending.set(true);
     }
+    let round = if win.fullscreen.get() {
+        0.0
+    } else {
+        win.rule_rounding
+            .get()
+            .unwrap_or(cfg.decoration.rounding)
+            .max(0) as f32
+    };
+    if !win.fullscreen.get() && win.rule_shadow.get().unwrap_or(true) {
+        if let Some(sc) = &cfg.decoration.shadow {
+            let (gx, gy) = out.pos.get();
+            let (ox, oy) = sc.offset;
+            let sr = Rect {
+                x1: rect.x1 - sc.size + ox,
+                y1: rect.y1 - sc.size + oy,
+                x2: rect.x2 + sc.size + ox,
+                y2: rect.y2 + sc.size + oy,
+            };
+            let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+            let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+            ops.push(RenderOp::Shadow {
+                pos: [fxp(sr.x1), fyp(sr.y1)],
+                size: [
+                    sr.width() as f32 / out.width as f32 * 2.0,
+                    sr.height() as f32 / out.height as f32 * 2.0,
+                ],
+                win_px: [
+                    (rect.x1 - gx + ox) as f32,
+                    (rect.y1 - gy + oy) as f32,
+                    rect.width() as f32,
+                    rect.height() as f32,
+                ],
+                radius: round,
+                range: sc.size as f32,
+                power: sc.power as f32,
+                color: sc.color,
+            });
+        }
+    }
     if !win.fullscreen.get() {
         let want = match focused {
             Some(f) => {
@@ -2413,18 +2452,10 @@ fn draw_window(
             None => cfg.layout.border.inactive,
         };
         let color = win.border_color_now(state, want);
-        push_borders(out, rect, cfg.layout.border.width, color, ops);
+        push_borders(out, rect, cfg.layout.border.width, round, color, ops);
     }
     let geo = win.geometry();
     let alpha = win.rule_opacity.get().unwrap_or(1.0);
-    let round = if win.fullscreen.get() {
-        0.0
-    } else {
-        win.rule_rounding
-            .get()
-            .unwrap_or(cfg.decoration.rounding)
-            .max(0) as f32
-    };
     draw_surface_tree(out, &surface, rect.x1 - geo.x1, rect.y1 - geo.y1, rect, alpha, round, ops, live);
     if let Some(tl) = win.xdg_opt() {
         draw_popups(state, out, &tl.xdg, rect.x1, rect.y1, screen, ops, live);
@@ -2605,6 +2636,28 @@ fn apply_batch(
                 *radius *= scale;
                 *mul *= alpha;
             }
+            RenderOp::Border { pos, size, rect_px, radius, width, color } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                    rect_px[i] = px_center[i] + (rect_px[i] - px_center[i]) * scale + px_d[i];
+                    rect_px[i + 2] *= scale;
+                }
+                *radius *= scale;
+                *width *= scale;
+                color[3] *= alpha;
+            }
+            RenderOp::Shadow { pos, size, win_px, radius, range, color, .. } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                    win_px[i] = px_center[i] + (win_px[i] - px_center[i]) * scale + px_d[i];
+                    win_px[i + 2] *= scale;
+                }
+                *radius *= scale;
+                *range *= scale;
+                color[3] *= alpha;
+            }
         }
     }
 }
@@ -2648,8 +2701,35 @@ fn slide_delta(out: &Output, r: Rect, dir: Option<crate::config::Dir>, remaining
     ]
 }
 
-/// four fills just outside the window box
-fn push_borders(out: &Rc<Output>, r: Rect, b: i32, color: [f32; 4], ops: &mut Vec<RenderOp>) {
+/// four fills just outside the window box, or one rounded ring
+fn push_borders(
+    out: &Rc<Output>,
+    r: Rect,
+    b: i32,
+    round: f32,
+    color: [f32; 4],
+    ops: &mut Vec<RenderOp>,
+) {
+    if round >= 0.5 && b > 0 {
+        let (gx, gy) = out.pos.get();
+        let (ox1, oy1) = (r.x1 - b, r.y1 - b);
+        let (ow, oh) = (r.width() + 2 * b, r.height() + 2 * b);
+        // quad pads one px past the ring for the aa edge
+        let fx = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+        let fy = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+        ops.push(RenderOp::Border {
+            pos: [fx(ox1 - 1), fy(oy1 - 1)],
+            size: [
+                (ow + 2) as f32 / out.width as f32 * 2.0,
+                (oh + 2) as f32 / out.height as f32 * 2.0,
+            ],
+            rect_px: [(ox1 - gx) as f32, (oy1 - gy) as f32, ow as f32, oh as f32],
+            radius: round + b as f32,
+            width: b as f32,
+            color,
+        });
+        return;
+    }
     let sides = [
         Rect { x1: r.x1 - b, y1: r.y1 - b, x2: r.x2 + b, y2: r.y1 },
         Rect { x1: r.x1 - b, y1: r.y2, x2: r.x2 + b, y2: r.y2 + b },

@@ -30,6 +30,30 @@ struct TexPush {
 }
 
 #[repr(C)]
+struct BorderPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    rect_px: [f32; 4],
+    radius: f32,
+    width: f32,
+    aa: f32,
+    _pad: f32,
+    color: [f32; 4],
+}
+
+#[repr(C)]
+struct ShadowPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    win_px: [f32; 4],
+    radius: f32,
+    range: f32,
+    power: f32,
+    aa: f32,
+    color: [f32; 4],
+}
+
+#[repr(C)]
 struct TexRPush {
     pos: [f32; 2],
     size: [f32; 2],
@@ -66,6 +90,26 @@ pub enum RenderOp {
         mul: f32,
         opaque: bool,
     },
+    /// a rounded ring in one quad; rect/radius in output-local pixels.
+    /// width past half the rect turns the ring into a rounded fill
+    Border {
+        pos: [f32; 2],
+        size: [f32; 2],
+        rect_px: [f32; 4],
+        radius: f32,
+        width: f32,
+        color: [f32; 4],
+    },
+    /// distance-falloff halo around a rounded window body
+    Shadow {
+        pos: [f32; 2],
+        size: [f32; 2],
+        win_px: [f32; 4],
+        radius: f32,
+        range: f32,
+        power: f32,
+        color: [f32; 4],
+    },
     /// tex clipped to a rounded rect; geo/radius in output-local pixels
     TexR {
         view: vk::ImageView,
@@ -85,6 +129,8 @@ impl RenderOp {
             RenderOp::Fill { color, .. } => color[3] < 1.0,
             RenderOp::Tex { opaque, mul, .. } => !opaque || *mul < 1.0,
             RenderOp::TexR { .. } => true,
+            RenderOp::Border { .. } => true,
+            RenderOp::Shadow { .. } => true,
         }
     }
 }
@@ -134,6 +180,8 @@ struct Pipelines {
     tex_opaque: vk::Pipeline,
     tex_blend: vk::Pipeline,
     texr_blend: vk::Pipeline,
+    border_blend: vk::Pipeline,
+    shadow_blend: vk::Pipeline,
 }
 
 pub struct Renderer {
@@ -143,6 +191,8 @@ pub struct Renderer {
     tex_set_layout: vk::DescriptorSetLayout,
     tex_layout: vk::PipelineLayout,
     texr_layout: vk::PipelineLayout,
+    border_layout: vk::PipelineLayout,
+    shadow_layout: vk::PipelineLayout,
     fill_layout: vk::PipelineLayout,
     pipes: Pipelines,
     pool: vk::CommandPool,
@@ -200,20 +250,40 @@ impl Renderer {
             .push_constant_ranges(&texr_range);
         let texr_layout = unsafe { dev.create_pipeline_layout(&texr_layout_info, None) }?;
 
+        let border_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<BorderPush>() as u32)];
+        let border_layout_info =
+            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&border_range);
+        let border_layout = unsafe { dev.create_pipeline_layout(&border_layout_info, None) }?;
+
+        let shadow_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<ShadowPush>() as u32)];
+        let shadow_layout_info =
+            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&shadow_range);
+        let shadow_layout = unsafe { dev.create_pipeline_layout(&shadow_layout_info, None) }?;
+
         let fill_module = create_module(dev, shaders::FILL)?;
         let tex_module = create_module(dev, shaders::TEX)?;
         let texr_module = create_module(dev, shaders::TEXR)?;
+        let border_module = create_module(dev, shaders::BORDER)?;
+        let shadow_module = create_module(dev, shaders::SHADOW)?;
         let pipes = Pipelines {
             fill_opaque: create_pipeline(dev, format, fill_module, fill_layout, false)?,
             fill_blend: create_pipeline(dev, format, fill_module, fill_layout, true)?,
             tex_opaque: create_pipeline(dev, format, tex_module, tex_layout, false)?,
             tex_blend: create_pipeline(dev, format, tex_module, tex_layout, true)?,
             texr_blend: create_pipeline(dev, format, texr_module, texr_layout, true)?,
+            border_blend: create_pipeline(dev, format, border_module, border_layout, true)?,
+            shadow_blend: create_pipeline(dev, format, shadow_module, shadow_layout, true)?,
         };
         unsafe {
             dev.destroy_shader_module(fill_module, None);
             dev.destroy_shader_module(tex_module, None);
             dev.destroy_shader_module(texr_module, None);
+            dev.destroy_shader_module(border_module, None);
+            dev.destroy_shader_module(shadow_module, None);
         }
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -231,6 +301,8 @@ impl Renderer {
             tex_set_layout,
             tex_layout,
             texr_layout,
+            border_layout,
+            shadow_layout,
             fill_layout,
             pipes,
             pool,
@@ -337,6 +409,8 @@ impl Renderer {
                 (RenderOp::Tex { .. }, false) => (self.pipes.tex_opaque, self.tex_layout),
                 (RenderOp::Tex { .. }, true) => (self.pipes.tex_blend, self.tex_layout),
                 (RenderOp::TexR { .. }, _) => (self.pipes.texr_blend, self.texr_layout),
+                (RenderOp::Border { .. }, _) => (self.pipes.border_blend, self.border_layout),
+                (RenderOp::Shadow { .. }, _) => (self.pipes.shadow_blend, self.shadow_layout),
             };
             unsafe {
                 if pipe != bound {
@@ -389,6 +463,44 @@ impl Renderer {
                             uv_pos: *uv_pos,
                             uv_size: *uv_size,
                             mul: *mul,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::Border { pos, size, rect_px, radius, width, color } => {
+                        let pc = BorderPush {
+                            pos: *pos,
+                            size: *size,
+                            rect_px: *rect_px,
+                            radius: radius.max(0.0),
+                            width: *width,
+                            aa: 0.7,
+                            _pad: 0.0,
+                            color: *color,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::Shadow { pos, size, win_px, radius, range, power, color } => {
+                        let pc = ShadowPush {
+                            pos: *pos,
+                            size: *size,
+                            win_px: *win_px,
+                            radius: radius.max(0.0),
+                            range: range.max(1.0),
+                            power: *power,
+                            aa: 0.7,
+                            color: *color,
                         };
                         dev.cmd_push_constants(
                             cb,
