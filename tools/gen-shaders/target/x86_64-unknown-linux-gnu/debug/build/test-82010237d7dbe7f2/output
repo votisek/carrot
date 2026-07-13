@@ -1,3 +1,0 @@
-cargo:rerun-if-changed=build.rs
-cargo:rustc-check-cfg=cfg(enable_unstable_features)
-cargo:rustc-cfg=enable_unstable_features

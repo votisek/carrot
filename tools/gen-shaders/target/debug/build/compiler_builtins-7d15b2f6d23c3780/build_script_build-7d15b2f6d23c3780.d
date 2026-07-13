@@ -1,6 +1,0 @@
-/home/bunny/Projects/carrot/carrot/tools/gen-shaders/target/debug/build/compiler_builtins-7d15b2f6d23c3780/build_script_build-7d15b2f6d23c3780.d: /nix/store/avhanq2hpppw2a4m0c1vbmb0xjgag53z-rust-nightly-with-components-2026-06-11/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/build.rs /nix/store/avhanq2hpppw2a4m0c1vbmb0xjgag53z-rust-nightly-with-components-2026-06-11/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/../libm/configure.rs
-
-/home/bunny/Projects/carrot/carrot/tools/gen-shaders/target/debug/build/compiler_builtins-7d15b2f6d23c3780/build_script_build-7d15b2f6d23c3780: /nix/store/avhanq2hpppw2a4m0c1vbmb0xjgag53z-rust-nightly-with-components-2026-06-11/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/build.rs /nix/store/avhanq2hpppw2a4m0c1vbmb0xjgag53z-rust-nightly-with-components-2026-06-11/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/../libm/configure.rs
-
-/nix/store/avhanq2hpppw2a4m0c1vbmb0xjgag53z-rust-nightly-with-components-2026-06-11/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/build.rs:
-/nix/store/avhanq2hpppw2a4m0c1vbmb0xjgag53z-rust-nightly-with-components-2026-06-11/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins/../libm/configure.rs:
