@@ -194,6 +194,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .add(std::rc::Rc::new(protocol::tearing::TearingManagerGlobal));
     state
         .globals
+        .add(std::rc::Rc::new(protocol::xdg_activation::ActivationGlobal));
+    state
+        .globals
         .add(std::rc::Rc::new(protocol::relative_pointer::RelativePointerManagerGlobal));
     state
         .globals

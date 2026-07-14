@@ -28,6 +28,8 @@ pub struct State {
     /// active output dimensions; pointer clamping reads this
     pub output_size: std::cell::Cell<(u32, u32)>,
     pub workspaces: RefCell<Vec<Rc<crate::tree::workspace::Workspace>>>,
+    /// minted activation tokens by string, with mint time; single use
+    pub activation_tokens: RefCell<std::collections::HashMap<String, u64>>,
     pub active_ws: std::cell::Cell<usize>,
     /// which output has focus; follows the pointer and workspace switches
     pub focused_output: std::cell::Cell<usize>,
@@ -95,6 +97,7 @@ impl State {
             wheel,
             clients: Clients::default(),
             globals: Globals::default(),
+            activation_tokens: RefCell::new(std::collections::HashMap::new()),
             run_toplevel: RunToplevel::install(eng),
             slow_clients: AsyncQueue::default(),
             damage: AsyncEvent::default(),

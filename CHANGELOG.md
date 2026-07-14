@@ -78,3 +78,4 @@
 - Live Rule Reload (Config Edits Land on Running Windows)
 - Single-Submit Frames (Offscreen Work Records as Ordered Pre-Passes, No Blocking GPU Waits)
 - Display Manager Sessions on Any Distro (carrot install: Session Entry, Portal Registration, IPC Client)
+- XDG Activation (Link Handoffs Focus the Running App and Follow It to Its Workspace)

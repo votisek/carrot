@@ -22,6 +22,7 @@ pub mod screencopy;
 pub mod shm;
 pub mod tearing;
 pub mod wire;
+pub mod xdg_activation;
 
 use std::fmt;
 
