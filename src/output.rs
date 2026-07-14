@@ -1971,7 +1971,9 @@ fn compose_ops(
         let target = if flip_ns == 0 || period_ns == 0 || out.conn.vrr_want.get() {
             crate::util::Time::now().nsec()
         } else {
-            flip_ns + period_ns
+            // a flip that idled goes stale; the next glass is never
+            // earlier than now, and a past clock replays settled anims
+            (flip_ns + period_ns).max(crate::util::Time::now().nsec())
         };
         state.anim_clock.freeze(target);
         out.anim_pending.set(false);
