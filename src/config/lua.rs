@@ -18,12 +18,54 @@ use super::{
     LayoutMode, ModKey, Motion, OutputCfg, PointerClassCfg, RemapProfile, RuleMatch,
     SetLayoutArg, ShadowCfg, SpawnCfg, Vrr, WindowRule,
 };
-use piccolo::{Closure, Executor, Lua, Table, Value};
+use piccolo::{Callback, CallbackReturn, Closure, Executor, IntoValue, Lua, Table, Value};
 
+/// the anchorless test entry; live paths use `parse_at` so include()
+/// resolves against the real file
+#[cfg(test)]
 pub fn parse(src: &str) -> Result<Config, Vec<String>> {
+    parse_inner(src, None)
+}
+
+/// same, anchored at the file's real path so `include("other.lua")`
+/// resolves relative to it
+pub fn parse_at(src: &str, path: &std::path::Path) -> Result<Config, Vec<String>> {
+    parse_inner(src, path.parent().map(std::path::Path::to_path_buf))
+}
+
+fn parse_inner(src: &str, dir: Option<std::path::PathBuf>) -> Result<Config, Vec<String>> {
     let mut lua = Lua::core();
     let ex = lua
         .try_enter(|ctx| {
+            // `include("file.lua")` runs the file in the same globals; the
+            // core sandbox has no io, so the loader is ours to provide
+            if let Some(dir) = dir {
+                let budget = std::rc::Rc::new(std::cell::Cell::new(0usize));
+                let include = Callback::from_fn(&ctx, move |ctx, _, mut stack| {
+                    let name: piccolo::String = stack.consume(ctx)?;
+                    let rel = std::str::from_utf8(name.as_bytes())
+                        .unwrap_or_default()
+                        .to_string();
+                    if budget.replace(budget.get() + 1) >= 64 {
+                        return Err("include: too many included files"
+                            .into_value(ctx)
+                            .into());
+                    }
+                    let q = std::path::Path::new(&rel);
+                    let p = if q.is_absolute() { q.to_path_buf() } else { dir.join(q) };
+                    let text = match std::fs::read_to_string(&p) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return Err(format!("include {}: {e}", p.display())
+                                .into_value(ctx)
+                                .into());
+                        }
+                    };
+                    let closure = Closure::load(ctx, Some(rel.as_str()), text.as_bytes())?;
+                    Ok(CallbackReturn::Call { function: closure.into(), then: None })
+                });
+                ctx.set_global("include", include)?;
+            }
             let closure = Closure::load(ctx, Some("carrot.lua"), src.as_bytes())?;
             Ok(ctx.stash(Executor::start(ctx, closure.into(), ())))
         })
@@ -1085,7 +1127,7 @@ mod tests {
 
     #[test]
     fn lua_and_kdl_parse_to_the_same_config() {
-        let kdl = crate::config::parse(
+        let kdl = crate::config::kdl::parse(
             r##"
             input {
                 keyboard { repeat-rate 35; repeat-delay 250 }

@@ -375,9 +375,9 @@ pub fn reload(state: &Rc<State>) -> Result<(), String> {
         }
     };
     let parsed = if path.extension().is_some_and(|e| e == "lua") {
-        crate::config::lua::parse(&text)
+        crate::config::lua::parse_at(&text, &path)
     } else {
-        crate::config::parse(&text)
+        crate::config::kdl::parse_at(&text, &path)
     };
     let cfg = match parsed {
         Ok(c) => c,

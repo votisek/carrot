@@ -12,7 +12,6 @@ pub mod kdl;
 pub mod lua;
 
 pub use default::DEFAULT_CONFIG;
-pub use kdl::parse;
 
 // action names double as the ipc vocabulary; every bind has a wire twin
 // by construction
@@ -696,9 +695,9 @@ pub fn load() -> Loaded {
         }
     };
     let parsed = if path.extension().is_some_and(|e| e == "lua") {
-        lua::parse(&text)
+        lua::parse_at(&text, &path)
     } else {
-        parse(&text)
+        kdl::parse_at(&text, &path)
     };
     match parsed {
         Ok(cfg) => Loaded::Ok(cfg),
@@ -727,9 +726,9 @@ pub fn check(path: Option<&str>) -> i32 {
         }
     };
     let parsed = if path.extension().is_some_and(|e| e == "lua") {
-        lua::parse(&text)
+        lua::parse_at(&text, &path)
     } else {
-        parse(&text)
+        kdl::parse_at(&text, &path)
     };
     match parsed {
         Ok(_) => {
@@ -1121,6 +1120,7 @@ pub fn resolve_remap(
 
 #[cfg(test)]
 mod tests {
+    use super::kdl::parse;
     use super::*;
 
     #[test]
@@ -1141,6 +1141,43 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn includes_merge_across_files() {
+        let dir = std::env::temp_dir().join(format!("carrot-inc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("binds.kdl"), "binds { Mod+Return { spawn \"foot\"; } }")
+            .unwrap();
+        std::fs::write(dir.join("main.kdl"), "layout { gaps-in 7 }\ninclude \"binds.kdl\"")
+            .unwrap();
+        let text = std::fs::read_to_string(dir.join("main.kdl")).unwrap();
+        let cfg = kdl::parse_at(&text, &dir.join("main.kdl")).unwrap();
+        assert_eq!(cfg.layout.gaps_in, 7);
+        // the included binds section reset the embedded default's binds
+        assert_eq!(cfg.binds.len(), 1);
+        // cycles and missing files fail loudly, labeled by file
+        std::fs::write(dir.join("a.kdl"), "include \"b.kdl\"").unwrap();
+        std::fs::write(dir.join("b.kdl"), "include \"a.kdl\"").unwrap();
+        let text = std::fs::read_to_string(dir.join("a.kdl")).unwrap();
+        let errs = kdl::parse_at(&text, &dir.join("a.kdl")).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("cycle")), "{errs:?}");
+        let errs = kdl::parse_at("include \"missing.kdl\"", &dir.join("main.kdl")).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("missing.kdl")), "{errs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lua_include_runs_sibling_files() {
+        let dir = std::env::temp_dir().join(format!("carrot-linc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("extra.lua"), "carrot.layout = { gaps_in = 9 }").unwrap();
+        let main = "carrot = {}\ninclude(\"extra.lua\")";
+        let cfg = lua::parse_at(main, &dir.join("carrot.lua")).unwrap();
+        assert_eq!(cfg.layout.gaps_in, 9);
+        // without a file anchor the loader stays out of the sandbox
+        assert!(lua::parse(main).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
