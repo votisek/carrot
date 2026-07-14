@@ -83,3 +83,5 @@
 - Workspace Axis Choice (Dwindle Picks Horizontal or Vertical Switching; Scrolling Stays Vertical)
 - Move-Column Verbs (The Whole Column Leapfrogs the Strip; Directional Swap Trades Window Slots Between Columns)
 - Guided Default Config (Per-Section Walkthrough, Decoration & No-CSD On, Screenshot/Media/Brightness Binds, Vim Keys, include Examples)
+- Numbered Crash Reports (Panic + Backtrace + stderr Tail in ~/.cache/carrot/carrotCrashLogN.log, Nothing Overwritten; the /tmp Log Retired)
+- Pinned Nightly Toolchain (rust-toolchain.toml Matches the Flake and taproot)

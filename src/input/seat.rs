@@ -1905,7 +1905,7 @@ mod tests {
 
     #[test]
     fn unlock_lands_on_the_position_hint() {
-        let (state, client, seat, s) = setup();
+        let (_state, client, seat, s) = setup();
         lock(&client, s.id, 71, 1).unwrap();
         let con = seat.constraint_for(&s).unwrap();
         let lp = LockedPointer { id: ObjectId(71), con };

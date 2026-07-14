@@ -73,8 +73,8 @@
           craneLib = crane.mkLib pkgs;
 
           # nightly is mandatory: -Z build-std + eyra. rust-src for build-std.
-          # pinned to taproot's rust-toolchain.toml so carrot and its libc
-          # build on the same compiler.
+          # pinned to rust-toolchain.toml (same date as taproot's) so every
+          # build path and the libc share one compiler.
           toolchain =
             (inputs'.fenix.packages.toolchainOf {
               channel = "nightly";
