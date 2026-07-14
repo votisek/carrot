@@ -82,6 +82,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "dlopen-rs",
+ "elf_loader",
  "kbvm",
  "kdl",
  "piccolo",
@@ -169,8 +170,6 @@ dependencies = [
 [[package]]
 name = "dlopen-rs"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3b5f4729554ae9d8602c413ebcfc2df6937e13dc9824bd52b357b2d8c634f41"
 dependencies = [
  "bitflags 2.13.0",
  "cfg-if",
@@ -213,8 +212,6 @@ checksum = "55dd888a213fc57e957abf2aa305ee3e8a28dbe05687a251f33b637cd46b0070"
 [[package]]
 name = "elf_loader"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0297947a5f5b79b1b86ae08aba48e25e1367637ded59b1112393e5b9176fe2ae"
 dependencies = [
  "bitflags 2.13.0",
  "cc",

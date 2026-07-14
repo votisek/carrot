@@ -1,5 +1,9 @@
 // module layout carved up front; empty mods are intentional.
 
+// the render loader donates a #[thread_local] surplus block to drivers
+// built with static tls; the attribute is the one nightly gate in the tree
+#![feature(thread_local)]
+
 // links origin (startup) + c-gull (libc) so std runs with zero linked C
 extern crate eyra;
 

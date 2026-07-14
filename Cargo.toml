@@ -22,6 +22,7 @@ eyra = { package = "taproot-eyra", version = "0.22.3", features = ["experimental
 ash = { version = "0.38", default-features = false }
 # pure-rust dynamic linker: loads the mesa icd + its closure against taproot
 dlopen-rs = "0.8"
+elf_loader = "0.14.0"
 rustix = { version = "1.1.4", features = ["net", "fs", "event", "io_uring", "mm", "param", "pipe", "time", "process"] }
 kbvm = "0.1.6"
 
@@ -59,3 +60,12 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # host units (build scripts, proc macros) stay dynamic
 [profile.release.build-override]
 rustflags = []
+
+# vendored with one fix: the tlsdesc dynamic resolver called its rust
+# half on a misaligned stack (entry rsp is 8 mod 16, and its saves kept
+# it there), faulting release builds of any dlopened closure with
+# dynamic tls - libLLVM in radv's. drop the vendor once upstream ships
+# the alignment fix.
+[patch.crates-io]
+elf_loader = { path = "vendor/elf_loader" }
+dlopen-rs = { path = "vendor/dlopen-rs" }
