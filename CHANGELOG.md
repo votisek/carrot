@@ -86,3 +86,4 @@
 - Numbered Crash Reports (Panic + Backtrace + stderr Tail in ~/.cache/carrot/carrotCrashLogN.log, Nothing Overwritten; the /tmp Log Retired)
 - Pinned Nightly Toolchain (rust-toolchain.toml Matches the Flake and taproot)
 - AMD/radv Sessions (taproot Recursive-Mutex ABI Fix Unwedges libLLVM Init; Stub Sonames Keep glibc Out of Driver Closures)
+- carrot doctor (One Run Reports Every GPU Bring-Up Stage + glibc-Leak Sweep to ~/carrotDoctor.log; Full Stub Family Covers libutil/libresolv)

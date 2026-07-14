@@ -71,6 +71,8 @@ pub fn run(args: &[String]) -> i32 {
             "libpthread.so.0",
             "libdl.so.2",
             "librt.so.1",
+            "libutil.so.1",
+            "libresolv.so.2",
             "ld-linux-x86-64.so.2",
         ] {
             match exe_dir.as_ref().map(|d| d.join(name)) {

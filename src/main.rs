@@ -39,6 +39,7 @@ mod install;
 mod ipc;
 mod pipewire;
 mod portal;
+mod doctor;
 mod sighand;
 mod tree;
 mod xwayland;
@@ -101,15 +102,15 @@ fn crash_dir() -> Option<std::path::PathBuf> {
     Some(base.join("carrot"))
 }
 
-/// one past the highest carrotCrashLog<n>.log already there
-fn next_crash_number(dir: &std::path::Path) -> u64 {
+/// one past the highest <prefix><n>.log already there
+fn next_report_number(dir: &std::path::Path, prefix: &str) -> u64 {
     let mut top = 0;
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let name = e.file_name();
             let Some(name) = name.to_str() else { continue };
             if let Some(n) = name
-                .strip_prefix("carrotCrashLog")
+                .strip_prefix(prefix)
                 .and_then(|r| r.strip_suffix(".log"))
                 .and_then(|r| r.parse::<u64>().ok())
             {
@@ -131,7 +132,7 @@ fn write_crash_report(
 ) -> Option<std::path::PathBuf> {
     use std::io::Write;
     std::fs::create_dir_all(dir).ok()?;
-    let mut n = next_crash_number(dir);
+    let mut n = next_report_number(dir, "carrotCrashLog");
     loop {
         let path = dir.join(format!("carrotCrashLog{n}.log"));
         let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
@@ -183,6 +184,9 @@ fn main() {
     }
     if std::env::args().any(|a| a == "spike-scanout") {
         std::process::exit(spike::run());
+    }
+    if std::env::args().any(|a| a == "doctor") {
+        std::process::exit(doctor::run());
     }
     if std::env::args().any(|a| a == "drm-probe") {
         std::process::exit(drm::device::probe_dump());
@@ -461,12 +465,12 @@ mod tests {
     fn crash_logs_number_past_the_highest() {
         let dir = std::env::temp_dir().join(format!("carrot-crashnum-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(super::next_crash_number(&dir), 1, "empty dir starts at 1");
+        assert_eq!(super::next_report_number(&dir, "carrotCrashLog"), 1, "empty dir starts at 1");
         std::fs::write(dir.join("carrotCrashLog1.log"), b"x").unwrap();
         std::fs::write(dir.join("carrotCrashLog7.log"), b"x").unwrap();
         std::fs::write(dir.join("carrotCrashLognope.log"), b"x").unwrap();
         std::fs::write(dir.join("unrelated.log"), b"x").unwrap();
-        assert_eq!(super::next_crash_number(&dir), 8, "counts past the highest");
+        assert_eq!(super::next_report_number(&dir, "carrotCrashLog"), 8, "counts past the highest");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
