@@ -203,8 +203,10 @@ never grabs the seat, so shell-drawn menus receive their clicks normally.
 
 Carrot's libc is [taproot](https://github.com/carrot-wm/taproot), a
 maintained pure-Rust fork of c-ward, pulled from crates.io as the
-`taproot-eyra`/`taproot-c-gull`/`taproot-c-scape` crates pinned by version -
-a plain clone builds against the exact libc revision carrot was tested with.
+`taproot-eyra`/`taproot-c-gull`/`taproot-c-scape`/`taproot-origin` crates
+pinned by version - a plain clone builds against the exact libc revision
+carrot was tested with. The dlopen-able `libc.so.6` itself ships as the
+[`taproot`](https://crates.io/crates/taproot) crate.
 
 ### With Nix
 
@@ -240,9 +242,10 @@ sudo ./target/x86_64-unknown-linux-gnu/release/carrot install
 stage it elsewhere: `carrot install --prefix /usr --root "$pkgdir"` writes
 under the root while the session entry points at the prefix.
 
-To hack on the libc itself, clone taproot next to carrot and flip the
-`eyra` dependency in `Cargo.toml` to the `../taproot/eyra` path noted
-there - its internal path deps pull the rest of the fork with it.
+To hack on the libc itself, clone taproot next to carrot and add
+`taproot-eyra = { path = "../taproot/eyra" }` under `[patch.crates-io]`
+in `Cargo.toml` - its internal path deps pull the rest of the fork,
+`taproot-origin` included, with it.
 
 System dependencies: a Vulkan driver (ICD) for your GPU - carrot never
 links the Khronos loader; it finds and loads the driver itself. Carrot

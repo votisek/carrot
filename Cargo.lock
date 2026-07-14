@@ -543,18 +543,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "origin"
-version = "0.26.2"
-dependencies = [
- "bitflags 2.13.0",
- "linux-raw-sys 0.9.4",
- "rustix",
- "rustix-futex-sync",
- "smallvec",
- "unwinding",
-]
-
-[[package]]
 name = "piccolo"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -895,9 +883,9 @@ dependencies = [
 
 [[package]]
 name = "taproot-c-scape"
-version = "0.22.3"
+version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65f987b80c9d72a3d9eef7ee48aa81b4b48d40970679ca42ab9fb4da775eebc7"
+checksum = "0e10483bdc00ce8f41162d4a010f4da9832bc5ed9956d333e464bbe0a51e8b2a"
 dependencies = [
  "bitflags 2.13.0",
  "errno",
@@ -905,7 +893,6 @@ dependencies = [
  "libm",
  "memoffset",
  "num-complex",
- "origin",
  "posix-regex",
  "printf-compat",
  "rand 0.9.4",
@@ -916,6 +903,7 @@ dependencies = [
  "rustix-dlmalloc",
  "rustix-futex-sync",
  "rustix-openpty",
+ "taproot-origin",
  "unwinding",
 ]
 
@@ -926,6 +914,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65a831d6cb392cbfe7d63c6bb8b74271e657ea57f23238db70aa56ff361ec777"
 dependencies = [
  "taproot-c-gull",
+]
+
+[[package]]
+name = "taproot-origin"
+version = "0.26.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c62b608cbfe78162e14456957c4adf798d8ea9d3eeac3209850f37b92cdfcce7"
+dependencies = [
+ "bitflags 2.13.0",
+ "linux-raw-sys 0.9.4",
+ "rustix",
+ "rustix-futex-sync",
+ "smallvec",
+ "unwinding",
 ]
 
 [[package]]
