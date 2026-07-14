@@ -152,30 +152,6 @@ wayland.windowManager.carrot = {
 
 </details>
 
-## Building
-
-Carrot links no system C - its libc is [taproot](https://github.com/carrot-wm/taproot),
-pulled in as a `[patch.crates-io]` git dependency pinned by revision, so a
-plain clone builds out of the box and links the exact libc revision carrot
-was tested against:
-
-```sh
-git clone https://github.com/carrot-wm/carrot
-cd carrot
-nix develop   # pins the toolchain; or use rustup with the pinned toolchain
-cargo build --release
-sudo ./target/x86_64-unknown-linux-gnu/release/carrot install
-```
-
-`carrot install` puts the binary, the `burrow` IPC client, a
-`wayland-sessions` entry, and the screencast portal registration under
-`/usr/local` - log out and pick "Carrot" at any display manager. Packagers
-can stage it: `carrot install --prefix /usr --root "$pkgdir"` writes under
-the root while the session entry points at the prefix.
-
-To hack on the libc itself, clone taproot next to carrot and flip the
-`[patch.crates-io]` entries in `Cargo.toml` to `path = "../taproot/..."`.
-
 ### Screensharing
 
 Carrot serves the ScreenCast portal itself and draws no chooser of its own,
@@ -225,6 +201,11 @@ never grabs the seat, so shell-drawn menus receive their clicks normally.
 
 ## Building
 
+Carrot's libc is [taproot](https://github.com/carrot-wm/taproot), a
+maintained pure-Rust fork of c-ward, pulled from crates.io as the
+`taproot-eyra`/`taproot-c-gull`/`taproot-c-scape` crates pinned by version -
+a plain clone builds against the exact libc revision carrot was tested with.
+
 ### With Nix
 
 ```sh
@@ -234,10 +215,31 @@ nix build github:carrot-wm/carrot
 ### With Cargo
 
 ```sh
+git clone https://github.com/carrot-wm/carrot
+cd carrot
+nix develop   # pins the toolchain; or rustup with the pinned nightly
 cargo build --release
+sudo ./target/x86_64-unknown-linux-gnu/release/carrot install
 ```
 
-System dependencies: just `vulkan-loader` (dlopened at runtime, never linked) and a Vulkan driver (ICD) for your GPU. Carrot links **zero C** - no `libdrm`, `libinput`, `libseat`, `libxkbcommon`, or `libwayland`; the DRM, input, and session stacks are all hand-rolled over raw syscalls. `kbvm` parses an embedded default US keymap, so carrot boots with no XKB data on disk; it only reads `xkeyboard-config` when you configure a non-default layout, wired up automatically by the Nix build.
+`carrot install` stages the binary, the `burrow` IPC client, taproot's
+`libc.so.6`/`libm.so.6` (the GPU driver binds these at runtime), a
+`wayland-sessions` entry, and the screencast portal registration under
+`/usr/local` - log out and pick "Carrot" at any display manager. Packagers
+stage it elsewhere: `carrot install --prefix /usr --root "$pkgdir"` writes
+under the root while the session entry points at the prefix.
+
+To hack on the libc itself, clone taproot next to carrot and flip the
+`eyra` dependency in `Cargo.toml` to the `../taproot/eyra` path noted
+there - its internal path deps pull the rest of the fork with it.
+
+System dependencies: a Vulkan driver (ICD) for your GPU - carrot never
+links the Khronos loader; it finds and loads the driver itself. Carrot
+links **zero C** - no `libdrm`, `libinput`, `libseat`, `libxkbcommon`, or
+`libwayland`; the DRM, input, and session stacks are all hand-rolled over
+raw syscalls. `kbvm` parses an embedded default US keymap, so carrot boots
+with no XKB data on disk; it only reads `xkeyboard-config` when you
+configure a non-default layout.
 
 ## Acknowledgments
 
