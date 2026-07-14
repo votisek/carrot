@@ -1,3 +1,7 @@
+# profile-rustflags ships the static-pie flag inside the crate, so a
+# registry install needs no RUSTFLAGS - the toolchain is nightly either way
+cargo-features = ["profile-rustflags"]
+
 [package]
 name = "carrot"
 version = "0.1.0"
@@ -50,3 +54,8 @@ overflow-checks = false
 
 [profile.release]
 panic = "abort"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# host units (build scripts, proc macros) stay dynamic
+[profile.release.build-override]
+rustflags = []

@@ -212,6 +212,17 @@ a plain clone builds against the exact libc revision carrot was tested with.
 nix build github:carrot-wm/carrot
 ```
 
+### From crates.io
+
+```sh
+cargo install carrot
+sudo ~/.cargo/bin/carrot install
+```
+
+One step per line: the manifest carries the static-PIE flags itself, so no
+RUSTFLAGS - just a nightly toolchain active. The second line registers the
+display-manager session.
+
 ### With Cargo
 
 ```sh
