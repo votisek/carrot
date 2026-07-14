@@ -203,7 +203,8 @@ impl Default for ShadowCfg {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlurCfg {
     pub passes: i32,
-    /// tap offset in half-pixels; bigger = blurrier per pass
+    /// per-level tap offset in that level's half-pixels; the dual-kawase
+    /// reference wants ~1.5-3, past 6 the taps alias into banding
     pub size: f64,
     pub noise: f64,
     pub contrast: f64,
@@ -212,7 +213,7 @@ pub struct BlurCfg {
 
 impl Default for BlurCfg {
     fn default() -> BlurCfg {
-        BlurCfg { passes: 3, size: 8.0, noise: 0.02, contrast: 1.0, brightness: 1.0 }
+        BlurCfg { passes: 3, size: 2.5, noise: 0.02, contrast: 1.0, brightness: 1.0 }
     }
 }
 
@@ -349,7 +350,7 @@ pub struct WindowRule {
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct LayerRule {
-    pub matches: Vec<String>,
+    pub matches: Vec<Pattern>,
     pub blur: bool,
 }
 
@@ -800,6 +801,29 @@ pub(crate) fn accel_profile(p: &str) -> Result<String, String> {
 pub(crate) fn regex(s: &str) -> Result<String, String> {
     regex_lite::Regex::new(s).map_err(|e| format!("bad regex \"{s}\": {e}"))?;
     Ok(s.to_string())
+}
+
+/// a regex compiled once at parse; per-frame matchers never rebuild
+#[derive(Clone, Debug)]
+pub struct Pattern {
+    pub src: String,
+    re: regex_lite::Regex,
+}
+
+impl Pattern {
+    pub fn new(s: &str) -> Result<Pattern, String> {
+        let re = regex_lite::Regex::new(s).map_err(|e| format!("bad regex \"{s}\": {e}"))?;
+        Ok(Pattern { src: s.to_string(), re })
+    }
+    pub fn matches(&self, hay: &str) -> bool {
+        self.re.is_match(hay)
+    }
+}
+
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Pattern) -> bool {
+        self.src == other.src
+    }
 }
 
 pub(crate) fn parse_mode(s: &str) -> Option<(u32, u32, Option<u32>)> {

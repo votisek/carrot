@@ -155,7 +155,7 @@ pub(super) fn layer_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
     let mut rule = LayerRule::default();
     for c in children(node) {
         match c.name().value() {
-            "match" => match c.get("namespace").and_then(|v| v.as_string()).map(regex) {
+            "match" => match c.get("namespace").and_then(|v| v.as_string()).map(Pattern::new) {
                 Some(Ok(p)) => rule.matches.push(p),
                 Some(Err(err)) => cx.leaf(c, err),
                 None => cx.at(c, "match wants namespace=, a regex string"),

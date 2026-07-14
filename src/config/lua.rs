@@ -562,7 +562,7 @@ fn decoration(v: &Value, cfg: &mut Config) -> Result<(), String> {
                             b.passes =
                                 super::int_in(need_int(&v, &key)?, "passes", 1, 4)? as i32;
                         }
-                        "size" => b.size = super::f64_in(need_num(&v, &key)?, "size", 0.5, 40.0)?,
+                        "size" => b.size = super::f64_in(need_num(&v, &key)?, "size", 0.5, 6.0)?,
                         "noise" => b.noise = super::f64_in(need_num(&v, &key)?, "noise", 0.0, 1.0)?,
                         "contrast" => {
                             b.contrast = super::f64_in(need_num(&v, &key)?, "contrast", 0.0, 2.0)?;
@@ -991,7 +991,7 @@ fn layer_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
             match key.as_str() {
                 "match" => {
                     for m in str_array(&v, "match").map_err(whine)? {
-                        rule.matches.push(super::regex(&m).map_err(whine)?);
+                        rule.matches.push(super::Pattern::new(&m).map_err(whine)?);
                     }
                 }
                 "blur" => rule.blur = need_bool(&v, &key).map_err(whine)?,

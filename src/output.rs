@@ -1702,9 +1702,18 @@ async fn present_loop(state: &Rc<State>, out: &Rc<Output>) {
         }
         out.renderer.recycle_frame(frame);
         let ms = (Time::now().nsec() / 1_000_000) as u32;
+        // the cursor surface never rides a scene walk but its client still
+        // paces animated cursors off frame callbacks
+        if let Some(seat) = state.seat.borrow().clone() {
+            if let crate::input::seat::CursorState::Surface(s) = &*seat.cursor.borrow() {
+                s.shown.set(true);
+            }
+        }
+        // throttle to what some compose drew since the last present:
+        // clients nobody can see stop rendering into the void
         state.clients.for_each(|c| {
             c.objects.for_each_surface(|s| {
-                if s.mapped.get() {
+                if s.mapped.get() && s.shown.replace(false) {
                     s.fire_frame_callbacks(ms);
                 }
             });
@@ -1961,8 +1970,8 @@ fn compose_scene(
     // overlay, layer popups; fullscreen hides everything below itself
     // except overlay
     if fs.is_none() {
-        draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live);
-        draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live);
+        draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live, false);
+        draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live, false);
     }
     let sw = out.ws_switch.borrow().clone();
     let now = state.anim_clock.now();
@@ -1994,10 +2003,10 @@ fn compose_scene(
         }
     }
     if fs.is_none() {
-        draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live);
+        draw_layer(state, out, crate::shell::layer::TOP, screen, &mut ops, &mut live, false);
         draw_closing_list(state, out, &out.closing_layers, &mut ops);
     }
-    draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live);
+    draw_layer(state, out, crate::shell::layer::OVERLAY, screen, &mut ops, &mut live, false);
     draw_layer_popups(state, out, fs.is_some(), screen, &mut ops, &mut live);
     // a drag icon rides the pointer, above everything but the cursor
     if ws_override.is_none() {
@@ -2050,6 +2059,7 @@ fn draw_surface_tree(
     if !surface.mapped.get() {
         return;
     }
+    surface.shown.set(true);
     if out.collect_fbs.get() {
         let mut latched = surface.latched_feedbacks.borrow_mut();
         if !latched.is_empty() {
@@ -2115,7 +2125,8 @@ fn draw_popups(
     xdg.for_each_popup(|p| draw_popup(state, out, p, ox, oy, screen, ops, live));
 }
 
-// one shell layer, mapping order = z within it
+// one shell layer, mapping order = z within it. rest draws for offscreen
+// bakes: no anim transform, no latch arming, no last_batch overwrite
 fn draw_layer(
     state: &Rc<State>,
     out: &Rc<Output>,
@@ -2123,6 +2134,7 @@ fn draw_layer(
     screen: Rect,
     ops: &mut Vec<RenderOp>,
     live: &mut Vec<(ClientId, u64)>,
+    rest: bool,
 ) {
     let layers = state.layers.borrow().clone();
     for ls in layers.iter() {
@@ -2142,6 +2154,9 @@ fn draw_layer(
         }
         let cmark = ops.len();
         draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, 0.0, ops, live);
+        if rest {
+            continue;
+        }
         let anim = ls.anim.borrow().clone();
         if let Some((a, style)) = anim {
             use crate::config::Style;
@@ -2391,26 +2406,40 @@ fn draw_buffer(
 /// a layer surface whose namespace hits a blur rule samples the cache
 fn layer_blur_on(cfg: &crate::config::Config, ns: &str) -> bool {
     cfg.decoration.blur.is_some()
-        && cfg.layer_rules.iter().any(|r| {
-            r.blur
-                && r.matches
-                    .iter()
-                    .any(|m| regex_lite::Regex::new(m).is_ok_and(|re| re.is_match(ns)))
-        })
+        && cfg
+            .layer_rules
+            .iter()
+            .any(|r| r.blur && r.matches.iter().any(|m| m.matches(ns)))
 }
 
 fn blur_consumers_visible(state: &Rc<State>, out: &Rc<Output>, cfg: &crate::config::Config) -> bool {
     if cfg.decoration.blur.is_none() {
         return false;
     }
+    let ws = state.workspaces.borrow().get(out.ws.get()).cloned();
+    let fs = ws.as_ref().and_then(|w| w.fullscreen.borrow().clone());
     for ls in state.layers.borrow().iter() {
-        if ls.output.get() == out.index.get() && ls.mapped() && layer_blur_on(cfg, &ls.namespace) {
+        // the cache's own sources can't consume it, and fullscreen hides
+        // every band but the overlay
+        let layer = ls.current.get().layer;
+        if ls.output.get() == out.index.get()
+            && ls.mapped()
+            && layer > crate::shell::layer::BOTTOM
+            && (fs.is_none() || layer == crate::shell::layer::OVERLAY)
+            && layer_blur_on(cfg, &ls.namespace)
+        {
             return true;
         }
     }
     let mut hit = false;
-    if let Some(ws) = state.workspaces.borrow().get(out.ws.get()) {
-        ws.for_each(|w| hit |= w.rule_blur.get());
+    if let Some(ws) = &ws {
+        if fs.is_none() {
+            ws.for_each(|w| hit |= w.rule_blur.get());
+        } else if cfg.layout.float_above_fullscreen {
+            for w in ws.floats.borrow().iter() {
+                hit |= w.rule_blur.get();
+            }
+        }
     }
     hit
 }
@@ -2427,13 +2456,17 @@ fn ensure_blur_cache(state: &Rc<State>, out: &Rc<Output>, screen: Rect, cfg: &cr
     if !blur_consumers_visible(state, out, cfg) {
         return;
     }
-    if !out.blur_dirty.replace(false) && out.blur.borrow().is_some() {
+    // a clean cache is only reusable at the current mode's dimensions
+    let fits_now = out.blur.borrow().as_ref().is_some_and(|c| {
+        c.levels.first().is_some_and(|t| (t.width, t.height) == (out.width, out.height))
+    });
+    if !out.blur_dirty.replace(false) && fits_now {
         return;
     }
     let mut ops = Vec::new();
     let mut live = Vec::new();
-    draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live);
-    draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live);
+    draw_layer(state, out, crate::shell::layer::BACKGROUND, screen, &mut ops, &mut live, true);
+    draw_layer(state, out, crate::shell::layer::BOTTOM, screen, &mut ops, &mut live, true);
     let passes = bc.passes.clamp(1, 4) as u32;
     let need: Vec<(u32, u32)> = (0..=passes)
         .map(|i| ((out.width >> i).max(1), (out.height >> i).max(1)))
@@ -2491,7 +2524,9 @@ fn ensure_blur_cache(state: &Rc<State>, out: &Rc<Output>, screen: Rect, cfg: &cr
     }
     for i in (0..passes as usize).rev() {
         let (src, dst) = (&cache.levels[i + 1], &cache.levels[i]);
-        let hp = [0.5 / src.width as f32 * sz, 0.5 / src.height as f32 * sz];
+        // both directions space taps by the render target's half-pixel;
+        // source-derived spacing doubled the upsample kernel per level
+        let hp = [0.5 / dst.width as f32 * sz, 0.5 / dst.height as f32 * sz];
         let last = i == 0;
         let op = RenderOp::Blur {
             view: src.view,

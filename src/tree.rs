@@ -379,11 +379,17 @@ impl Window {
         state.anim_clock.touch();
         let now = state.anim_clock.now();
         let mut anims = self.anims.borrow_mut();
-        // retarget folds the current visual offset into the new from-delta
+        // retarget folds the current visual offset into the new from-delta;
+        // the scalar velocity is per-span, so rescale it to the new span or
+        // the handoff speed jumps with the delta magnitude
         let (cdx, cdy, vel) = match &anims.move_ {
             Some(m) => {
                 let v = m.anim.value(now);
-                (m.dx * v + dx, m.dy * v + dy, m.anim.velocity(now))
+                let (cdx, cdy) = (m.dx * v + dx, m.dy * v + dy);
+                let old = (m.dx * m.dx + m.dy * m.dy).sqrt();
+                let new = (cdx * cdx + cdy * cdy).sqrt();
+                let vel = if new > 1e-6 { m.anim.velocity(now) * old / new } else { 0.0 };
+                (cdx, cdy, vel)
             }
             None => (dx, dy, 0.0),
         };

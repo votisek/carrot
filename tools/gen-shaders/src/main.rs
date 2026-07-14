@@ -950,7 +950,8 @@ fn build_blur(down: bool) -> Vec<u32> {
         sum = b.f_add(c.vec4, None, sum, d4).unwrap();
         let inv8 = b.constant_bit32(c.f32t, 0.125f32.to_bits());
         let avg = b.vector_times_scalar(c.vec4, None, sum, inv8).unwrap();
-        // extra_a = contrast about mid, extra_b = brightness multiply
+        // extra_a = contrast about mid, extra_b = brightness multiply;
+        // both shape color only - alpha is coverage and must pass through
         let half4 = {
             let h = b.constant_bit32(c.f32t, 0.5f32.to_bits());
             b.composite_construct(c.vec4, None, vec![h, h, h, h]).unwrap()
@@ -958,7 +959,12 @@ fn build_blur(down: bool) -> Vec<u32> {
         let centered = b.f_sub(c.vec4, None, avg, half4).unwrap();
         let con = b.vector_times_scalar(c.vec4, None, centered, extra_a).unwrap();
         let back = b.f_add(c.vec4, None, con, half4).unwrap();
-        acc = b.vector_times_scalar(c.vec4, None, back, extra_b).unwrap();
+        let adj = b.vector_times_scalar(c.vec4, None, back, extra_b).unwrap();
+        let ar = b.composite_extract(c.f32t, None, adj, vec![0]).unwrap();
+        let ag = b.composite_extract(c.f32t, None, adj, vec![1]).unwrap();
+        let ab = b.composite_extract(c.f32t, None, adj, vec![2]).unwrap();
+        let aa = b.composite_extract(c.f32t, None, avg, vec![3]).unwrap();
+        acc = b.composite_construct(c.vec4, None, vec![ar, ag, ab, aa]).unwrap();
     } else {
         // eight taps, doubled diagonals, /12
         let two = b.constant_bit32(c.f32t, 2.0f32.to_bits());

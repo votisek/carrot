@@ -123,7 +123,7 @@ fn blur(node: &KdlNode, out: &mut BlurCfg, cx: &mut Cx) -> bool {
             }
             "size" => {
                 if let Some(v) = cx.float(c) {
-                    match f64_in(v, "size", 0.5, 40.0) {
+                    match f64_in(v, "size", 0.5, 6.0) {
                         Ok(v) => out.size = v,
                         Err(e) => {
                             cx.leaf(c, e);
