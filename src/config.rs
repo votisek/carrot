@@ -352,6 +352,9 @@ pub struct WindowRule {
 pub struct LayerRule {
     pub matches: Vec<Pattern>,
     pub blur: bool,
+    /// backdrop only where surface alpha >= this; unset covers the whole
+    /// rect. argb surfaces only - xrgb views pin alpha to one
+    pub ignore_alpha: Option<f64>,
 }
 
 // -- animations: per-kind spring/ease motion plus visual styles --

@@ -110,6 +110,10 @@ animations {
 
 // layer-rule {
 //     match namespace=#"^launcher$"#
+//     blur #true
+//     // backdrop only where the surface's own alpha reaches the gate;
+//     // argb surfaces only (xrgb reads as fully opaque)
+//     ignore-alpha 0.1
 // }
 
 // remap "example-game" {

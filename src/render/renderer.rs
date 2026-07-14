@@ -76,6 +76,16 @@ struct BlurPush {
 }
 
 #[repr(C)]
+struct BlurMaskPush {
+    pos: [f32; 2],
+    size: [f32; 2],
+    buv_pos: [f32; 2],
+    buv_size: [f32; 2],
+    threshold: f32,
+    mul: f32,
+}
+
+#[repr(C)]
 struct TexRPush {
     pos: [f32; 2],
     size: [f32; 2],
@@ -141,6 +151,19 @@ pub enum RenderOp {
         extra_b: f32,
         up: bool,
     },
+    /// blurred backdrop clipped to the surface's own coverage: the cache
+    /// sample is gated by step(threshold, surface alpha). buv is the
+    /// cache's uv window in output space
+    BlurMask {
+        cache_view: vk::ImageView,
+        surface_view: vk::ImageView,
+        pos: [f32; 2],
+        size: [f32; 2],
+        buv_pos: [f32; 2],
+        buv_size: [f32; 2],
+        threshold: f32,
+        mul: f32,
+    },
     /// two textures stretched to the quad, mixed by progress, clipped to
     /// the rounded geometry; the resize crossfade
     Xfade {
@@ -175,6 +198,7 @@ impl RenderOp {
             RenderOp::Shadow { .. } => true,
             RenderOp::Xfade { .. } => true,
             RenderOp::Blur { .. } => false,
+            RenderOp::BlurMask { .. } => true,
         }
     }
 }
@@ -270,6 +294,7 @@ struct Pipelines {
     xfade_blend: vk::Pipeline,
     blur_down: vk::Pipeline,
     blur_up: vk::Pipeline,
+    blur_mask_blend: vk::Pipeline,
 }
 
 pub struct Renderer {
@@ -282,6 +307,7 @@ pub struct Renderer {
     xfade_set_layout: vk::DescriptorSetLayout,
     xfade_layout: vk::PipelineLayout,
     blur_layout: vk::PipelineLayout,
+    blur_mask_layout: vk::PipelineLayout,
     border_layout: vk::PipelineLayout,
     shadow_layout: vk::PipelineLayout,
     fill_layout: vk::PipelineLayout,
@@ -377,6 +403,15 @@ impl Renderer {
             .push_constant_ranges(&blur_range);
         let blur_layout = unsafe { dev.create_pipeline_layout(&blur_layout_info, None) }?;
 
+        // masked backdrop shares the two-sampler set with the crossfade
+        let blur_mask_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .size(size_of::<BlurMaskPush>() as u32)];
+        let blur_mask_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&xf_set_layouts)
+            .push_constant_ranges(&blur_mask_range);
+        let blur_mask_layout = unsafe { dev.create_pipeline_layout(&blur_mask_layout_info, None) }?;
+
         let border_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .size(size_of::<BorderPush>() as u32)];
@@ -399,6 +434,7 @@ impl Renderer {
         let xfade_module = create_module(dev, shaders::XFADE)?;
         let blur_down_module = create_module(dev, shaders::BLUR_DOWN)?;
         let blur_up_module = create_module(dev, shaders::BLUR_UP)?;
+        let blur_mask_module = create_module(dev, shaders::BLUR_MASK)?;
         let pipes = Pipelines {
             fill_opaque: create_pipeline(dev, format, fill_module, fill_layout, false)?,
             fill_blend: create_pipeline(dev, format, fill_module, fill_layout, true)?,
@@ -410,6 +446,7 @@ impl Renderer {
             xfade_blend: create_pipeline(dev, format, xfade_module, xfade_layout, true)?,
             blur_down: create_pipeline(dev, format, blur_down_module, blur_layout, false)?,
             blur_up: create_pipeline(dev, format, blur_up_module, blur_layout, false)?,
+            blur_mask_blend: create_pipeline(dev, format, blur_mask_module, blur_mask_layout, true)?,
         };
         unsafe {
             dev.destroy_shader_module(fill_module, None);
@@ -420,6 +457,7 @@ impl Renderer {
             dev.destroy_shader_module(xfade_module, None);
             dev.destroy_shader_module(blur_down_module, None);
             dev.destroy_shader_module(blur_up_module, None);
+            dev.destroy_shader_module(blur_mask_module, None);
         }
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -440,6 +478,7 @@ impl Renderer {
             xfade_set_layout,
             xfade_layout,
             blur_layout,
+            blur_mask_layout,
             border_layout,
             shadow_layout,
             fill_layout,
@@ -725,6 +764,9 @@ impl Renderer {
                     if *up { self.pipes.blur_up } else { self.pipes.blur_down },
                     self.blur_layout,
                 ),
+                (RenderOp::BlurMask { .. }, _) => {
+                    (self.pipes.blur_mask_blend, self.blur_mask_layout)
+                }
             };
             unsafe {
                 if pipe != bound {
@@ -812,6 +854,57 @@ impl Renderer {
                             halfpixel: *halfpixel,
                             extra_a: *extra_a,
                             extra_b: *extra_b,
+                        };
+                        dev.cmd_push_constants(
+                            cb,
+                            layout,
+                            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            0,
+                            push_bytes(&pc),
+                        );
+                    }
+                    RenderOp::BlurMask {
+                        cache_view,
+                        surface_view,
+                        pos,
+                        size,
+                        buv_pos,
+                        buv_size,
+                        threshold,
+                        mul,
+                    } => {
+                        let infos0 = [vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*cache_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        let infos1 = [vk::DescriptorImageInfo::default()
+                            .sampler(self.sampler)
+                            .image_view(*surface_view)
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                        let writes = [
+                            vk::WriteDescriptorSet::default()
+                                .dst_binding(0)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(&infos0),
+                            vk::WriteDescriptorSet::default()
+                                .dst_binding(1)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .image_info(&infos1),
+                        ];
+                        self.core.ext_push_desc.cmd_push_descriptor_set(
+                            cb,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            layout,
+                            0,
+                            &writes,
+                        );
+                        let pc = BlurMaskPush {
+                            pos: *pos,
+                            size: *size,
+                            buv_pos: *buv_pos,
+                            buv_size: *buv_size,
+                            threshold: *threshold,
+                            mul: *mul,
                         };
                         dev.cmd_push_constants(
                             cb,

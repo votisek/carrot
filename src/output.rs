@@ -2169,13 +2169,20 @@ fn draw_layer(
         let r = ls.rect.get();
         let mark = ops.len();
         let lmark = live.len();
-        if layer > crate::shell::layer::BOTTOM
-            && layer_blur_on(&state.config.borrow().clone(), &ls.namespace)
-        {
-            push_blur_backdrop(out, r, 0.0, ops);
-        }
-        let cmark = ops.len();
         draw_surface_tree(out, &ls.surface, r.x1, r.y1, screen, 1.0, 0.0, ops, live);
+        // the backdrop clips to the surface's own alpha, so it can only be
+        // built once draw_buffer cached the texture; it slides under the
+        // surface here and stays out of the seized batch (the cache view
+        // isn't the batch's to keep)
+        let mut cmark = mark;
+        if layer > crate::shell::layer::BOTTOM {
+            if let Some(thr) = layer_blur(&state.config.borrow().clone(), &ls.namespace) {
+                if let Some(op) = blur_mask_op(out, &ls.surface, r, thr) {
+                    ops.insert(mark, op);
+                    cmark += 1;
+                }
+            }
+        }
         if rest {
             continue;
         }
@@ -2428,13 +2435,14 @@ fn draw_buffer(
     }
 }
 
-/// a layer surface whose namespace hits a blur rule samples the cache
-fn layer_blur_on(cfg: &crate::config::Config, ns: &str) -> bool {
-    cfg.decoration.blur.is_some()
-        && cfg
-            .layer_rules
-            .iter()
-            .any(|r| r.blur && r.matches.iter().any(|m| m.matches(ns)))
+/// a layer surface whose namespace hits a blur rule samples the cache;
+/// the value is the rule's alpha gate (0 = the whole rect)
+fn layer_blur(cfg: &crate::config::Config, ns: &str) -> Option<f32> {
+    cfg.decoration.blur.as_ref()?;
+    cfg.layer_rules
+        .iter()
+        .find(|r| r.blur && r.matches.iter().any(|m| m.matches(ns)))
+        .map(|r| r.ignore_alpha.unwrap_or(0.0) as f32)
 }
 
 fn blur_consumers_visible(state: &Rc<State>, out: &Rc<Output>, cfg: &crate::config::Config) -> bool {
@@ -2451,7 +2459,7 @@ fn blur_consumers_visible(state: &Rc<State>, out: &Rc<Output>, cfg: &crate::conf
             && ls.mapped()
             && layer > crate::shell::layer::BOTTOM
             && (fs.is_none() || layer == crate::shell::layer::OVERLAY)
-            && layer_blur_on(cfg, &ls.namespace)
+            && layer_blur(cfg, &ls.namespace).is_some()
         {
             return true;
         }
@@ -2556,6 +2564,45 @@ fn ensure_blur_cache(state: &Rc<State>, out: &Rc<Output>, screen: Rect, cfg: &cr
         };
         pp.push(PrePass::new(dst, black, vec![op]));
     }
+}
+
+/// the backdrop gated by the surface's own alpha; needs the texture
+/// draw_buffer cached earlier in this compose. None (no cache, no buffer,
+/// import failed) means no backdrop at all - better than a full-rect smudge
+fn blur_mask_op(out: &Rc<Output>, s: &Rc<WlSurface>, r: Rect, threshold: f32) -> Option<RenderOp> {
+    let slot = out.blur.borrow();
+    let cache = slot.as_ref()?;
+    let buffer = s.buffer.borrow();
+    let att = buffer.as_ref()?;
+    let key = if att.buf.dmabuf().is_some() {
+        (s.client.id, att.buf.uid)
+    } else {
+        (s.client.id, s.uid)
+    };
+    let textures = out.textures.borrow();
+    let (tex, _) = textures.get(&key)?;
+    let (gx, gy) = out.pos.get();
+    let fxp = |v: i32| (v - gx) as f32 / out.width as f32 * 2.0 - 1.0;
+    let fyp = |v: i32| (v - gy) as f32 / out.height as f32 * 2.0 - 1.0;
+    Some(RenderOp::BlurMask {
+        cache_view: cache.levels.first()?.view,
+        surface_view: tex.view,
+        pos: [fxp(r.x1), fyp(r.y1)],
+        size: [
+            r.width() as f32 / out.width as f32 * 2.0,
+            r.height() as f32 / out.height as f32 * 2.0,
+        ],
+        buv_pos: [
+            (r.x1 - gx) as f32 / out.width as f32,
+            (r.y1 - gy) as f32 / out.height as f32,
+        ],
+        buv_size: [
+            r.width() as f32 / out.width as f32,
+            r.height() as f32 / out.height as f32,
+        ],
+        threshold,
+        mul: 1.0,
+    })
 }
 
 /// the blurred backdrop under a rect, rounded to taste
@@ -2685,6 +2732,7 @@ fn remap_local(ops: &mut [RenderOp], out: &Output, r: Rect) {
                 geo_px[1] -= py;
             }
             RenderOp::Blur { .. } => {}
+            RenderOp::BlurMask { pos, size, .. } => map_pos(pos, size),
         }
     }
 }
@@ -3201,6 +3249,13 @@ fn apply_batch(
                     geo_px[i + 2] *= scale;
                 }
                 *radius *= scale;
+            }
+            RenderOp::BlurMask { pos, size, mul, .. } => {
+                for i in 0..2 {
+                    pos[i] = center[i] + (pos[i] - center[i]) * scale + d[i];
+                    size[i] *= scale;
+                }
+                *mul *= alpha;
             }
             // pre-pass only; never inside a window batch
             RenderOp::Blur { .. } => {}

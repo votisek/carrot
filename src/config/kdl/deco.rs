@@ -242,6 +242,13 @@ mod tests {
         );
         assert_eq!(c.rules[0].blur, Some(true));
         assert!(c.layer_rules[0].blur);
+        assert_eq!(c.layer_rules[0].ignore_alpha, None);
+        let c = parse_ok(
+            "layer-rule { match namespace=\"^bar$\"\n blur\n ignore-alpha 0.2 }",
+        );
+        assert_eq!(c.layer_rules[0].ignore_alpha, Some(0.2));
+        let errs = parse_errs("layer-rule { match namespace=\"x\"\n ignore-alpha 1.5 }");
+        assert!(errs.iter().any(|e| e.contains("ignore-alpha")), "{errs:?}");
     }
 
     #[test]

@@ -165,6 +165,14 @@ pub(super) fn layer_rule(node: &KdlNode, cfg: &mut Config, cx: &mut Cx) {
                     rule.blur = b;
                 }
             }
+            "ignore-alpha" => {
+                if let Some(v) = cx.float(c) {
+                    match f64_in(v, "ignore-alpha", 0.0, 1.0) {
+                        Ok(v) => rule.ignore_alpha = Some(v),
+                        Err(e) => cx.leaf(c, e),
+                    }
+                }
+            }
             other => cx.at(c, &format!("unknown layer-rule key \"{other}\"")),
         }
     }

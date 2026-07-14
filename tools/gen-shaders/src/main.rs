@@ -37,6 +37,7 @@ enum GLOp {
     FMax = 40,
     FClamp = 43,
     FMix = 46,
+    Step = 48,
     SmoothStep = 49,
     Length = 66,
 }
@@ -829,6 +830,128 @@ fn build_xfade() -> Vec<u32> {
 }
 
 
+// blur-mask push block (40 bytes): vec2 dst_pos @0, vec2 dst_size @8,
+// vec2 buv_pos @16, vec2 buv_size @24, float threshold @32, float mul @36.
+// two samplers: binding 0 = blur cache (sampled in output uv space),
+// binding 1 = the surface's own texture (corner uv). the cache sample is
+// gated by step(threshold, surface alpha): the backdrop exists only where
+// the surface itself has coverage. threshold 0 passes everywhere.
+fn build_blur_mask() -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    let set = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let c = common(&mut b);
+
+    let pc_struct = b.type_struct(vec![c.vec2, c.vec2, c.vec2, c.vec2, c.f32t, c.f32t]);
+    b.decorate(pc_struct, Decoration::Block, vec![]);
+    for (i, off) in [0u32, 8, 16, 24, 32, 36].iter().enumerate() {
+        b.member_decorate(
+            pc_struct,
+            i as u32,
+            Decoration::Offset,
+            vec![Operand::LiteralBit32(*off)],
+        );
+    }
+    let ptr_pc = b.type_pointer(None, StorageClass::PushConstant, pc_struct);
+    let pc_var = b.variable(ptr_pc, None, StorageClass::PushConstant, None);
+    let ptr_pc_f32 = b.type_pointer(None, StorageClass::PushConstant, c.f32t);
+    let c_i32_3 = b.constant_bit32(c.i32t, 3);
+    let c_i32_4 = b.constant_bit32(c.i32t, 4);
+    let c_i32_5 = b.constant_bit32(c.i32t, 5);
+
+    let image = b.type_image(c.f32t, Dim::Dim2D, 0, 0, 0, 1, ImageFormat::Unknown, None);
+    let sampled = b.type_sampled_image(image);
+    let ptr_uc = b.type_pointer(None, StorageClass::UniformConstant, sampled);
+    let tex_cache = b.variable(ptr_uc, None, StorageClass::UniformConstant, None);
+    b.decorate(tex_cache, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
+    b.decorate(tex_cache, Decoration::Binding, vec![Operand::LiteralBit32(0)]);
+    let tex_surf = b.variable(ptr_uc, None, StorageClass::UniformConstant, None);
+    b.decorate(tex_surf, Decoration::DescriptorSet, vec![Operand::LiteralBit32(0)]);
+    b.decorate(tex_surf, Decoration::Binding, vec![Operand::LiteralBit32(1)]);
+
+    // vertex globals: position plus the raw corner as uv
+    let vidx = b.variable(c.ptr_in_i32, None, StorageClass::Input, None);
+    b.decorate(vidx, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::VertexIndex)]);
+    let gl_pos = b.variable(c.ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(gl_pos, Decoration::BuiltIn, vec![Operand::BuiltIn(BuiltIn::Position)]);
+    let ptr_out_vec2 = b.type_pointer(None, StorageClass::Output, c.vec2);
+    let uv_out = b.variable(ptr_out_vec2, None, StorageClass::Output, None);
+    b.decorate(uv_out, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+
+    // fragment globals
+    let ptr_in_vec2 = b.type_pointer(None, StorageClass::Input, c.vec2);
+    let uv_in = b.variable(ptr_in_vec2, None, StorageClass::Input, None);
+    b.decorate(uv_in, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+    let out_color = b.variable(c.ptr_out_vec4, None, StorageClass::Output, None);
+    b.decorate(out_color, Decoration::Location, vec![Operand::LiteralBit32(0)]);
+
+    // vs_main
+    let vs = b
+        .begin_function(c.void, None, FunctionControl::NONE, c.fn_void)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let idx = b.load(c.i32t, None, vidx, None, vec![]).unwrap();
+    let x_i = b.bitwise_and(c.i32t, None, idx, c.c_i32_1).unwrap();
+    let y_i = b.shift_right_arithmetic(c.i32t, None, idx, c.c_i32_1).unwrap();
+    let x = b.convert_s_to_f(c.f32t, None, x_i).unwrap();
+    let y = b.convert_s_to_f(c.f32t, None, y_i).unwrap();
+    let corner = b.composite_construct(c.vec2, None, vec![x, y]).unwrap();
+    let pos_ptr = b
+        .access_chain(c.ptr_pc_vec2, None, pc_var, vec![c.c_i32_0])
+        .unwrap();
+    let pos = b.load(c.vec2, None, pos_ptr, None, vec![]).unwrap();
+    let size_ptr = b
+        .access_chain(c.ptr_pc_vec2, None, pc_var, vec![c.c_i32_1])
+        .unwrap();
+    let size = b.load(c.vec2, None, size_ptr, None, vec![]).unwrap();
+    let vscaled = b.f_mul(c.vec2, None, corner, size).unwrap();
+    let ndc = b.f_add(c.vec2, None, pos, vscaled).unwrap();
+    store_position(&mut b, &c, gl_pos, ndc);
+    b.store(uv_out, corner, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    // fs_main
+    let fs = b
+        .begin_function(c.void, None, FunctionControl::NONE, c.fn_void)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let uv = b.load(c.vec2, None, uv_in, None, vec![]).unwrap();
+    let bp_ptr = b.access_chain(c.ptr_pc_vec2, None, pc_var, vec![c.c_i32_2]).unwrap();
+    let buv_pos = b.load(c.vec2, None, bp_ptr, None, vec![]).unwrap();
+    let bs_ptr = b.access_chain(c.ptr_pc_vec2, None, pc_var, vec![c_i32_3]).unwrap();
+    let buv_size = b.load(c.vec2, None, bs_ptr, None, vec![]).unwrap();
+    let scaled = b.f_mul(c.vec2, None, uv, buv_size).unwrap();
+    let buv = b.f_add(c.vec2, None, buv_pos, scaled).unwrap();
+    let sc = b.load(sampled, None, tex_cache, None, vec![]).unwrap();
+    let cache = b
+        .image_sample_implicit_lod(c.vec4, None, sc, buv, None, vec![])
+        .unwrap();
+    let ss = b.load(sampled, None, tex_surf, None, vec![]).unwrap();
+    let surf = b
+        .image_sample_implicit_lod(c.vec4, None, ss, uv, None, vec![])
+        .unwrap();
+    let a = b.composite_extract(c.f32t, None, surf, vec![3]).unwrap();
+    let thr_ptr = b.access_chain(ptr_pc_f32, None, pc_var, vec![c_i32_4]).unwrap();
+    let thr = b.load(c.f32t, None, thr_ptr, None, vec![]).unwrap();
+    let gate = glsl(&mut b, set, c.f32t, GLOp::Step, &[thr, a]);
+    let mul_ptr = b.access_chain(ptr_pc_f32, None, pc_var, vec![c_i32_5]).unwrap();
+    let mul = b.load(c.f32t, None, mul_ptr, None, vec![]).unwrap();
+    let f = b.f_mul(c.f32t, None, gate, mul).unwrap();
+    let out = b.vector_times_scalar(c.vec4, None, cache, f).unwrap();
+    b.store(out_color, out, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+
+    b.entry_point(ExecutionModel::Vertex, vs, "vs_main", vec![vidx, gl_pos, uv_out]);
+    b.entry_point(ExecutionModel::Fragment, fs, "fs_main", vec![uv_in, out_color]);
+    b.execution_mode(fs, ExecutionMode::OriginUpperLeft, vec![]);
+
+    b.module().assemble()
+}
+
 // the kawase pair share one skeleton: fullscreen quad, corner uv, one
 // sampler, push = vec2 dst_pos @0, vec2 dst_size @8, vec2 halfpixel @16,
 // float extra_a @24, float extra_b @28 (down: contrast/brightness,
@@ -1039,6 +1162,7 @@ fn main() {
     let xfade = build_xfade();
     let blur_down = build_blur(true);
     let blur_up = build_blur(false);
+    let blur_mask = build_blur_mask();
 
     let own_src = std::fs::read_to_string(tool_dir.join("src/main.rs")).unwrap();
     let gen_hash = hex(&Sha256::digest(own_src.as_bytes()));
@@ -1058,6 +1182,7 @@ fn main() {
     emit_const(&mut out, "XFADE", &xfade);
     emit_const(&mut out, "BLUR_DOWN", &blur_down);
     emit_const(&mut out, "BLUR_UP", &blur_up);
+    emit_const(&mut out, "BLUR_MASK", &blur_mask);
 
     writeln!(
         out,
@@ -1075,6 +1200,7 @@ mod tests {{
     const XFADE_HASH: &str = "{xfade_hash}";
     const BLUR_DOWN_HASH: &str = "{blur_down_hash}";
     const BLUR_UP_HASH: &str = "{blur_up_hash}";
+    const BLUR_MASK_HASH: &str = "{blur_mask_hash}";
     const REGEN: &str =
         "shaders out of date - rerun: cargo run --manifest-path tools/gen-shaders/Cargo.toml";
 
@@ -1102,6 +1228,7 @@ mod tests {{
         assert_eq!(XFADE_HASH, words_hash(super::XFADE), "{{REGEN}}");
         assert_eq!(BLUR_DOWN_HASH, words_hash(super::BLUR_DOWN), "{{REGEN}}");
         assert_eq!(BLUR_UP_HASH, words_hash(super::BLUR_UP), "{{REGEN}}");
+        assert_eq!(BLUR_MASK_HASH, words_hash(super::BLUR_MASK), "{{REGEN}}");
     }}
 
     #[test]
@@ -1114,6 +1241,7 @@ mod tests {{
         assert_eq!(super::XFADE[0], 0x0723_0203);
         assert_eq!(super::BLUR_DOWN[0], 0x0723_0203);
         assert_eq!(super::BLUR_UP[0], 0x0723_0203);
+        assert_eq!(super::BLUR_MASK[0], 0x0723_0203);
     }}
 }}"#,
         gen_hash = gen_hash,
@@ -1125,12 +1253,13 @@ mod tests {{
         xfade_hash = words_hash(&xfade),
         blur_down_hash = words_hash(&blur_down),
         blur_up_hash = words_hash(&blur_up),
+        blur_mask_hash = words_hash(&blur_mask),
     )
     .unwrap();
 
     std::fs::write(render_dir.join("shaders.rs"), out).unwrap();
     println!(
         "wrote shaders.rs ({} modules)",
-        8
+        9
     );
 }

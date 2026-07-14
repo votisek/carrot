@@ -995,6 +995,12 @@ fn layer_rules(v: &Value, cfg: &mut Config) -> Result<(), String> {
                     }
                 }
                 "blur" => rule.blur = need_bool(&v, &key).map_err(whine)?,
+                "ignore_alpha" => {
+                    rule.ignore_alpha = Some(
+                        super::f64_in(need_num(&v, &key).map_err(whine)?, "ignore_alpha", 0.0, 1.0)
+                            .map_err(whine)?,
+                    )
+                }
                 other => return Err(whine(format!("unknown key `{other}`"))),
             }
         }
