@@ -51,9 +51,9 @@ pub enum Action {
     ToggleFullWidth,
     CenterColumn,
     SetLayout(SetLayoutArg),
-    /// grab the window under the cursor and let the pointer carry it;
-    /// bound to a mouse chord it drags, bound to a key it sticks until
-    /// the next click
+    /// grab the window under the cursor and let the pointer carry it
+    /// while the chord is held: a mouse bind ends on button release, a
+    /// key bind ends when its key comes back up
     PointerMove,
     /// same grab, resizing by the quadrant the pointer started in
     PointerResize,

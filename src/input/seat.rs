@@ -57,6 +57,8 @@ pub struct SeatGlobal {
     remap_held: RefCell<HashMap<u32, u32>>,
     /// a matched release-kind bind waits here; any other press disarms
     armed_release: RefCell<Option<(u32, crate::config::Action)>>,
+    /// the key that started a pointer grab; its release ends the grab
+    grab_key: Cell<Option<u32>>,
     /// last fire per chord, for cooldown-ms binds
     bind_cooldowns: RefCell<std::collections::HashMap<(u32, u32), u64>>,
     // clipboard state rides on the seat: devices, sources, selection
@@ -127,6 +129,7 @@ impl SeatGlobal {
             last_press_serial: Cell::new(0),
             remap_held: RefCell::new(HashMap::new()),
             armed_release: RefCell::new(None),
+            grab_key: Cell::new(None),
             bind_cooldowns: RefCell::new(std::collections::HashMap::new()),
             data: Default::default(),
             primary: Default::default(),
@@ -148,6 +151,7 @@ impl SeatGlobal {
         *self.grab.borrow_mut() = None;
         state.grab_active.set(false);
         *self.armed_release.borrow_mut() = None;
+        self.grab_key.set(None);
         self.cancel_repeat();
     }
 
@@ -991,6 +995,13 @@ impl SeatGlobal {
                     if !self.cooldown_clear(b) {
                         continue;
                     }
+                    // a grab lives while its key is held
+                    if matches!(
+                        b.action,
+                        crate::config::Action::PointerMove | crate::config::Action::PointerResize
+                    ) {
+                        self.grab_key.set(Some(key));
+                    }
                     if b.repeat {
                         // re-fires from the repeat loop while held
                         self.arm_repeat(key);
@@ -1002,6 +1013,17 @@ impl SeatGlobal {
             }
             *self.armed_release.borrow_mut() = armed;
         } else {
+            // the grab's key came back up: the move/resize session ends;
+            // the seat rc lives in state, the &self path can't call end_grab
+            if self.grab_key.get() == Some(key) {
+                self.grab_key.set(None);
+                if self.grab.borrow().is_some() {
+                    if let Some(seat) = state.seat.borrow().clone() {
+                        seat.end_grab(state);
+                    }
+                }
+                return KeyAction::Handled;
+            }
             // the armed key came back up: fire, once
             let hit = {
                 let mut slot = self.armed_release.borrow_mut();
@@ -1826,6 +1848,33 @@ mod tests {
         lock(&client, s.id, 73, 2).unwrap();
         assert_eq!(count_events(&client.queued_out_bytes(), ObjectId(1), 0), 1);
         let _ = seat;
+    }
+
+    #[test]
+    fn a_pointer_grab_key_consumes_its_release() {
+        use crate::config::{Action, Bind};
+        let (state, _client, seat, _s) = setup();
+        let mut cfg = crate::config::empty();
+        cfg.binds.push(Bind {
+            mods: 0,
+            key: 45,
+            action: Action::PointerMove,
+            on_release: false,
+            repeat: false,
+            allow_when_locked: false,
+            cooldown_ms: None,
+            title: None,
+        });
+        *state.config.borrow_mut() = Rc::new(cfg);
+        // the press fires the bind and remembers the key
+        assert!(matches!(
+            seat.key(&state, 1_000, 45, true),
+            KeyAction::Act(Action::PointerMove)
+        ));
+        assert_eq!(seat.grab_key.get(), Some(45));
+        // the release ends the session instead of reaching the client
+        assert!(matches!(seat.key(&state, 2_000, 45, false), KeyAction::Handled));
+        assert_eq!(seat.grab_key.get(), None);
     }
 
     #[test]
