@@ -88,3 +88,6 @@
 - AMD/radv Sessions (taproot Recursive-Mutex ABI Fix Unwedges libLLVM Init; Stub Sonames Keep glibc Out of Driver Closures)
 - carrot doctor (One Run Reports Every GPU Bring-Up Stage + glibc-Leak Sweep to ~/carrotDoctor.log; Full Stub Family Covers libutil/libresolv)
 - NVIDIA Sessions (Vendored dlopen-rs Routes the Driver's Own dl* Calls, Survives Recursive dlopen + Versioned Lookups; Driver Threads Get Real TLS)
+- Monotonic Input Timestamps (EVIOCSCLOCKID at Open + vt Resume; Device and Synthetic Events Share One Clock)
+- Late-Latch Frame Scheduling (Dirty Frames Render Just Ahead of Their Vblank Under an Adaptive Margin; Frame Callbacks Fire at Latch for Every-Vblank Client Pacing)
+- Fullscreen Direct Scanout (A Lone dmabuf Rides the Primary Plane With Zero Compositor GPU Work; ZERO_COPY Presentation Feedback)
