@@ -775,13 +775,42 @@ pub fn focus_cycle(state: &Rc<State>, dir: i32) {
         return;
     }
     let cur = focused_window(state);
+    let from = cur.as_ref().map(|c| c.rect.get()).unwrap_or_default();
     let idx = cur.and_then(|c| wins.iter().position(|w| Rc::ptr_eq(w, &c)));
     let next = match idx {
         Some(i) => (i as i32 + dir).rem_euclid(wins.len() as i32) as usize,
         None => 0,
     };
     focus_window(state, Some(&wins[next]));
+    warp_pointer_into(state, from, &wins[next]);
     state.damage.trigger();
+}
+
+/// keyboard focus moved windows: carry the pointer along, holding its
+/// relative position from the old rect; a pointer that was elsewhere
+/// lands centered
+fn warp_pointer_into(state: &Rc<State>, from: Rect, win: &Rc<Window>) {
+    let Some(seat) = state.seat.borrow().clone() else { return };
+    let to = win.rect.get();
+    if to.is_empty() {
+        return;
+    }
+    let (px, py) = (seat.ptr_x.get(), seat.ptr_y.get());
+    let inside = from.width() > 0 && from.height() > 0 && from.contains(px as i32, py as i32);
+    let (fx, fy) = if inside {
+        (
+            (px - from.x1 as f64) / from.width() as f64,
+            (py - from.y1 as f64) / from.height() as f64,
+        )
+    } else {
+        (0.5, 0.5)
+    };
+    let nx = to.x1 as f64 + fx * to.width() as f64;
+    let ny = to.y1 as f64 + fy * to.height() as f64;
+    seat.warp(state, nx, ny);
+    if let Some(d) = state.display.borrow().as_ref() {
+        d.move_cursor(state, nx as i32, ny as i32);
+    }
 }
 
 // -- directional navigation --
@@ -831,9 +860,11 @@ pub fn focus_dir(state: &Rc<State>, dir: Dir) {
     {
         ws.tiling.strip.note_focus(&cur);
         if let Some(next) = ws.tiling.strip.focus_dir(dir) {
+            let from = cur.rect.get();
             // keep-in-view follows the newly active column
             relayout(state, &ws);
             focus_window(state, Some(&next));
+            warp_pointer_into(state, from, &next);
             state.damage.trigger();
         }
         return;
@@ -847,6 +878,7 @@ pub fn focus_dir(state: &Rc<State>, dir: Dir) {
     let rects: Vec<Rect> = cands.iter().map(|w| w.rect.get()).collect();
     if let Some(i) = dir_pick(cur.rect.get(), &rects, dir) {
         focus_window(state, Some(&cands[i]));
+        warp_pointer_into(state, cur.rect.get(), &cands[i]);
         state.damage.trigger();
     }
 }
