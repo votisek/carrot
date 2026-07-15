@@ -182,6 +182,29 @@
                 default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.carrot;
                 defaultText = "inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.carrot";
               };
+
+            # This option is currently not used but the home-manager module tests for way-displays
+            # expect this to be present for all entries of wayland.windowManager.
+              systemd = {
+                enable = lib.mkEnableOption null // {
+                  default = false;
+                  description = "";
+                };
+
+                variables = mkOption {
+                  type = types.listOf types.str;
+                  default = [ ];
+                  example = [ "--all" ];
+                  description = "";
+                };
+
+                extraCommands = mkOption {
+                  type = types.listOf types.str;
+                  default = [ ];
+                  description = "";
+                };
+              };
+
               settings = mkOption {
                 type = types.nullOr (types.submodule {
                   options = {
